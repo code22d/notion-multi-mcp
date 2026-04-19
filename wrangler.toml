@@ -1,0 +1,40 @@
+# =====================================================================
+# notion-multi-mcp — Cloudflare Worker
+# =====================================================================
+# Deploy with:   npx wrangler deploy
+# Tail logs:     npx wrangler tail
+#
+# Before first deploy:
+#   1. Create the KV namespace:
+#        npx wrangler kv namespace create NOTION_MCP_KV
+#      Then paste the returned id into the [[kv_namespaces]] block below.
+#
+#   2. Set secrets (one-time):
+#        npx wrangler secret put MCP_AUTH_TOKEN         # random string — Claude sends this in Authorization header
+#        npx wrangler secret put NOTION_OAUTH_CLIENT_ID
+#        npx wrangler secret put NOTION_OAUTH_CLIENT_SECRET
+#
+#   3. After first deploy, note the worker URL (e.g. https://notion-multi-mcp.reneceo.workers.dev)
+#      and set the redirect URI in your Notion integration to:
+#          https://notion-multi-mcp.<your-subdomain>.workers.dev/oauth/callback
+# =====================================================================
+
+name = "notion-multi-mcp"
+main = "src/index.ts"
+compatibility_date = "2025-04-18"
+compatibility_flags = ["nodejs_compat"]
+
+# Uncomment & set once you know the URL you want (optional — workers.dev URL works fine too)
+# route = { pattern = "notion-mcp.yourdomain.com/*", zone_name = "yourdomain.com" }
+
+[vars]
+# PUBLIC_BASE_URL is overridden at deploy time if you have a custom route.
+# For the default workers.dev URL, leave this empty — the worker reads it from the request.
+PUBLIC_BASE_URL = ""
+
+[[kv_namespaces]]
+binding = "NOTION_MCP_KV"
+id = "8101642dc8ff4d33aa209b4e3f662143"
+
+[observability]
+enabled = true
