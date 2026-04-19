@@ -12,8 +12,8 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250419.0",
+    "@notionhq/client": "^5.19.0",
     "typescript": "^5.4.5",
     "wrangler": "^3.114.0"
-  },
-  "dependencies": {}
+  }
 }
