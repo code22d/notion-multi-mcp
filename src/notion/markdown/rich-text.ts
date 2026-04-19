@@ -18,10 +18,38 @@ export function richTextToMarkdown(rt: NotionRichText[] | undefined | null): str
 }
 
 function oneToMarkdown(r: NotionRichText): string {
+  // Equations render as $expr$ — inline LaTeX.
+  if (r.type === "equation" && r.equation?.expression) {
+    return `$${r.equation.expression}$`;
+  }
+
+  // Mentions: render as a tagged span so from-blocks → to-blocks can round-trip them.
+  if (r.type === "mention" && r.mention) {
+    const m = r.mention as Record<string, unknown>;
+    const mentionType = (m.type ?? "") as string;
+    const label = r.plain_text ?? "";
+    if (mentionType === "page" && m.page && typeof m.page === "object") {
+      const pageId = (m.page as { id?: string }).id ?? "";
+      return `<page id="${pageId}">${escapeMdInline(label)}</page>`;
+    }
+    if (mentionType === "database" && m.database && typeof m.database === "object") {
+      const dbId = (m.database as { id?: string }).id ?? "";
+      return `<database id="${dbId}">${escapeMdInline(label)}</database>`;
+    }
+    if (mentionType === "user" && m.user && typeof m.user === "object") {
+      const userId = (m.user as { id?: string }).id ?? "";
+      return `<user id="${userId}">${escapeMdInline(label)}</user>`;
+    }
+    if (mentionType === "date" && m.date && typeof m.date === "object") {
+      const d = m.date as { start?: string; end?: string | null };
+      const val = d.end ? `${d.start} → ${d.end}` : (d.start ?? "");
+      return `<date>${val}</date>`;
+    }
+    // Fallback: plain text.
+    return label;
+  }
+
   let text = r.plain_text ?? "";
-  // Escape markdown metacharacters only if we're in a plain text run.
-  // For now, avoid aggressive escaping — it's noisy. Callers who need strict
-  // escaping should wrap this.
   const ann = r.annotations ?? {};
   if (ann.code) text = "`" + text + "`";
   if (ann.bold) text = "**" + text + "**";
@@ -34,6 +62,11 @@ function oneToMarkdown(r: NotionRichText): string {
     text = `[${text}](${r.href})`;
   }
   return text;
+}
+
+function escapeMdInline(s: string): string {
+  // Only escape the few chars that actually break our output.
+  return s.replace(/[<>]/g, (c) => (c === "<" ? "&lt;" : "&gt;"));
 }
 
 /** Wraps a plain string into a single-element rich-text array (for writes to Notion). */

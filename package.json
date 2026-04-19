@@ -8,12 +8,17 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "tsx test/roundtrip.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250419.0",
     "@notionhq/client": "^5.19.0",
+    "tsx": "^4.21.0",
     "typescript": "^5.4.5",
     "wrangler": "^3.114.0"
+  },
+  "dependencies": {
+    "marked": "^18.0.2"
   }
 }

@@ -17,8 +17,8 @@ A multi-account Notion MCP server, hosted on Cloudflare Workers. Gives you (and 
 | `notion_get_comments` | ✅ Fully implemented |
 | `notion_create_comment` | ✅ Page-level + replies (content-anchored not supported by public API) |
 | `notion_move_pages` | ✅ Fully implemented |
-| `notion_create_pages` | 🚧 Phase 2 stub (needs Notion-flavored Markdown converter) |
-| `notion_update_page` | 🚧 Phase 2 stub |
+| `notion_create_pages` | ✅ Phase 2 — Markdown → Notion blocks conversion for CORE block types (paragraphs, headings, lists, task lists, quotes, code, divider, callouts, toggles, tables, images, page links, equations) |
+| `notion_update_page` | 🚧 Phase 2 stub (Markdown diff engine still pending) |
 | `notion_create_database` | 🚧 Phase 3 stub (needs SQL DDL parser) |
 | `notion_update_data_source` | 🚧 Phase 3 stub |
 | `notion_create_view` / `notion_update_view` | 🚧 Phase 4 stub (needs View DSL parser) |
