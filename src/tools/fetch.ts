@@ -200,7 +200,10 @@ function extractPageTitle(properties: Record<string, unknown>): string {
   return "";
 }
 
-function describeProperties(properties: Record<string, unknown>): string {
+function describeProperties(properties: Record<string, unknown> | undefined | null): string {
+  // In API version 2025-09-03+, database properties live on the individual
+  // data sources, not the top-level database object. Guard accordingly.
+  if (!properties) return "_(none — properties live on the data sources; fetch a `collection://<id>` to see them)_";
   const keys = Object.keys(properties);
   if (keys.length === 0) return "_(none)_";
   return keys

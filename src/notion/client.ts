@@ -247,7 +247,8 @@ export interface NotionDatabaseObject {
   id: string;
   title: NotionRichText[];
   description?: NotionRichText[];
-  properties: Record<string, unknown>;
+  // Optional in API version 2025-09-03+ — properties moved onto data_sources.
+  properties?: Record<string, unknown>;
   parent: { type: string; [key: string]: unknown };
   url: string;
   archived?: boolean;
