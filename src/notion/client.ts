@@ -213,6 +213,21 @@ export class NotionClient {
       body,
     });
   }
+
+  /** POST /v1/views — create a view on a data source. */
+  createView(body: unknown): Promise<NotionViewObject> {
+    return this.request<NotionViewObject>(`/views`, { method: "POST", body });
+  }
+
+  /** GET /v1/views/{id} */
+  getView(viewId: string): Promise<NotionViewObject> {
+    return this.request<NotionViewObject>(`/views/${stripDashes(viewId)}`);
+  }
+
+  /** PATCH /v1/views/{id} */
+  updateView(viewId: string, body: unknown): Promise<NotionViewObject> {
+    return this.request<NotionViewObject>(`/views/${stripDashes(viewId)}`, { method: "PATCH", body });
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -274,6 +289,21 @@ export interface NotionBlockObject {
   has_children?: boolean;
   archived?: boolean;
   [key: string]: unknown;
+}
+
+export interface NotionViewObject {
+  object: "view";
+  id: string;
+  parent: { type: string; database_id?: string; [key: string]: unknown };
+  name: string;
+  type: "table" | "board" | "list" | "calendar" | "timeline" | "gallery" | "form" | "chart" | "map" | "dashboard";
+  created_time: string;
+  last_edited_time: string;
+  url: string;
+  data_source_id?: string | null;
+  filter?: Record<string, unknown> | null;
+  sorts?: Array<Record<string, unknown>> | null;
+  configuration?: Record<string, unknown> | null;
 }
 
 export interface NotionUserObject {
