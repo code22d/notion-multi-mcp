@@ -315,6 +315,17 @@ function sanitizeTypeBody(payload: Record<string, unknown>, type: string): void 
     }
   }
 
+  // Strip top-level null-valued fields from the type body. Notion's block
+  // response shape includes things like `icon: null` and `color: null` on
+  // most block bodies, but the request schema rejects `null` for those
+  // fields (they must be an object or absent). synced_from:null is a
+  // meaningful signal for a synced_block original, so keep that one.
+  for (const key of Object.keys(b)) {
+    if (b[key] === null && key !== "synced_from") {
+      delete b[key];
+    }
+  }
+
   // Rich text runs also carry a plain_text and href that the API recomputes —
   // safe to keep but the API ignores them. We leave them as-is.
 }

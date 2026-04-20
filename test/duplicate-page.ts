@@ -144,7 +144,28 @@ console.log("\n=== duplicate_page: toBlockRequest ===");
   assert(body?.file === undefined, "old file object removed");
 }
 
-// 9) column_list + column with nested paragraph — inlined hierarchy preserved.
+// 9) Paragraph with icon: null and color: null — response-only nulls stripped,
+//    synced_from: null preserved on synced_block.
+{
+  const src = hydratedBlock("paragraph", {
+    rich_text: [{ type: "text", text: { content: "hi" } }],
+    icon: null,
+    color: null,
+  });
+  const out = toBlockRequest(src);
+  const body = out ? ((out as Record<string, unknown>).paragraph as Record<string, unknown>) : undefined;
+  assert(body !== undefined && !("icon" in body), "paragraph.icon: null stripped from body");
+  assert(body !== undefined && !("color" in body), "paragraph.color: null stripped from body");
+  assert(Array.isArray(body?.rich_text), "rich_text preserved");
+}
+{
+  const src = hydratedBlock("synced_block", { synced_from: null });
+  const out = toBlockRequest(src);
+  const body = out ? ((out as Record<string, unknown>).synced_block as Record<string, unknown>) : undefined;
+  assert(body !== undefined && "synced_from" in body && body!.synced_from === null, "synced_from: null retained");
+}
+
+// 10) column_list + column with nested paragraph — inlined hierarchy preserved.
 {
   const inner = hydratedBlock("paragraph", { rich_text: [{ type: "text", text: { content: "col item" } }] });
   const column = hydratedBlock("column", {}, { children: [inner] });
