@@ -5,7 +5,7 @@
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient, type NotionPageObject, type NotionDatabaseObject } from "../notion/client";
+import { NotionClient, type NotionPageObject, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 
 export function registerSearchTool(register: (def: ToolDef) => void): void {
@@ -20,8 +20,9 @@ export function registerSearchTool(register: (def: ToolDef) => void): void {
         query: { type: "string", description: "Search query. Empty string returns everything." },
         filter: {
           type: "string",
-          enum: ["any", "page", "database"],
-          description: "Restrict results to only pages or only databases. Default: any.",
+          enum: ["any", "page", "database", "data_source"],
+          description:
+            "Restrict results. 'page' = pages only; 'data_source' (or legacy alias 'database') = data sources only; 'any' = both. Default: any. Note: Notion renamed the filter value from 'database' to 'data_source' in API 2025-09-03; we accept both and map to 'data_source'.",
         },
         sort: {
           type: "string",
@@ -61,7 +62,10 @@ async function searchHandler(args: Record<string, unknown>, ctx: ToolContext): P
     },
   };
   if (filter === "page") body.filter = { value: "page", property: "object" };
-  if (filter === "database") body.filter = { value: "database", property: "object" };
+  // Map both legacy "database" and canonical "data_source" to the 2025-09-03 API value.
+  if (filter === "database" || filter === "data_source") {
+    body.filter = { value: "data_source", property: "object" };
+  }
   if (typeof args.start_cursor === "string") body.start_cursor = args.start_cursor;
 
   const res = await client.search(body);
@@ -76,15 +80,26 @@ async function searchHandler(args: Record<string, unknown>, ctx: ToolContext): P
   return { content: [{ type: "text", text: lines.join("\n") }] };
 }
 
-function formatSearchResult(item: NotionPageObject | NotionDatabaseObject): string {
+function formatSearchResult(item: NotionPageObject | NotionDatabaseObject | NotionDataSourceObject): string {
   if (item.object === "page") {
     const title = extractPageTitle(item.properties);
     return `- [page] **${title || "(untitled)"}** — ${item.url}\n  id: ${item.id} · last edited: ${item.last_edited_time}`;
   }
-  // database
-  const title = richTextToPlain(item.title);
-  const sources = item.data_sources?.map((d) => `collection://${d.id}`).join(", ") ?? "";
-  return `- [database] **${title || "(untitled)"}** — ${item.url}\n  id: ${item.id}${
+  if (item.object === "data_source") {
+    // 2025-09-03 API: search results for filter "data_source" return data source objects
+    // with `name` (not `title`). URL + last_edited_time may or may not be present.
+    const ds = item as NotionDataSourceObject & { url?: string; last_edited_time?: string };
+    const parent = ds.database_parent?.database_id
+      ? ` · database: ${ds.database_parent.database_id}`
+      : "";
+    const url = ds.url ? ` — ${ds.url}` : "";
+    return `- [data_source] **${ds.name || "(untitled)"}**${url}\n  id: ${ds.id} · collection://${ds.id}${parent}`;
+  }
+  // Legacy database object (unfiltered search may still return these from older API behavior)
+  const db = item as NotionDatabaseObject;
+  const title = richTextToPlain(db.title);
+  const sources = db.data_sources?.map((d) => `collection://${d.id}`).join(", ") ?? "";
+  return `- [database] **${title || "(untitled)"}** — ${db.url}\n  id: ${db.id}${
     sources ? ` · sources: ${sources}` : ""
   }`;
 }

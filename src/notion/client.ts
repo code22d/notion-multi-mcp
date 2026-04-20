@@ -116,10 +116,11 @@ export class NotionClient {
   search(body: {
     query?: string;
     sort?: { direction: "ascending" | "descending"; timestamp: "last_edited_time" };
-    filter?: { value: "page" | "database"; property: "object" };
+    // API 2025-09-03 renamed filter value from "database" to "data_source".
+    filter?: { value: "page" | "data_source"; property: "object" };
     start_cursor?: string;
     page_size?: number;
-  }): Promise<PaginatedList<NotionPageObject | NotionDatabaseObject>> {
+  }): Promise<PaginatedList<NotionPageObject | NotionDatabaseObject | NotionDataSourceObject>> {
     return this.request(`/search`, { method: "POST", body });
   }
 
