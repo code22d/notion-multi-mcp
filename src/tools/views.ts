@@ -18,6 +18,7 @@ import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../accounts/resolver";
 import { NotionClient, stripDashes, type NotionViewObject } from "../notion/client";
 import { parseViewDsl, ParseError } from "../notion/view-dsl/parser";
 import { emitViewBody, EmitError, type EmittedViewBody, type ViewType } from "../notion/view-dsl/emit";
+import type { DirectiveAst } from "../notion/view-dsl/ast";
 
 export function registerViewTools(register: (def: ToolDef) => void): void {
   register({
@@ -89,7 +90,19 @@ async function createViewHandler(args: Record<string, unknown>, ctx: ToolContext
   let body: EmittedViewBody;
   try {
     const directives = configure.trim() === "" ? [] : parseViewDsl(configure);
-    body = emitViewBody(directives, { viewType: type });
+    // If any directive references a property by name in a slot that Notion
+    // wants a property_id for (GROUP BY / CALENDAR BY / TIMELINE BY / MAP BY /
+    // CHART / SHOW / COVER-by-property), fetch the data source and build a
+    // name → id resolver. Filter/sort-only DSLs skip the fetch.
+    let resolvePropertyId: ((name: string) => string) | undefined;
+    if (directivesNeedIdResolution(directives)) {
+      const ds = await client.getDataSource(dataSourceId);
+      resolvePropertyId = makeResolverFromProperties(ds.properties);
+    }
+    body = emitViewBody(directives, {
+      viewType: type,
+      ...(resolvePropertyId !== undefined ? { resolvePropertyId } : {}),
+    });
   } catch (e) {
     return toolErrorFromDsl(e);
   }
@@ -132,25 +145,43 @@ async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext
   }
 
   // If any configuration-touching directive is present, we need the view type —
-  // fetch the view to discover it.
+  // fetch the view to discover it. We'll also use the fetched view's
+  // data_source_id to look up property ids when the DSL references properties
+  // by name.
   const needsViewType = directives.some(
     (d) => d.kind !== "filter" && d.kind !== "sort"
   );
+  const needsIdResolution = directivesNeedIdResolution(directives);
 
   let viewType: ViewType | undefined;
-  if (needsViewType) {
+  let resolvePropertyId: ((name: string) => string) | undefined;
+  if (needsViewType || needsIdResolution) {
     try {
       const existing = await client.getView(viewId);
       viewType = existing.type;
+      if (needsIdResolution) {
+        const dsId = existing.data_source_id;
+        if (!dsId) {
+          return textErr(
+            `notion_update_view: the fetched view has no data_source_id, so property names cannot be resolved to ids. Pass property ids in the DSL instead.`
+          );
+        }
+        const ds = await client.getDataSource(dsId);
+        resolvePropertyId = makeResolverFromProperties(ds.properties);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return textErr(`notion_update_view could not read the existing view to determine its type: ${msg}`);
+      return textErr(`notion_update_view could not read the existing view: ${msg}`);
     }
   }
 
   let body: EmittedViewBody;
   try {
-    body = emitViewBody(directives, { viewType, forUpdate: true });
+    body = emitViewBody(directives, {
+      viewType,
+      forUpdate: true,
+      ...(resolvePropertyId !== undefined ? { resolvePropertyId } : {}),
+    });
   } catch (e) {
     return toolErrorFromDsl(e);
   }
@@ -201,4 +232,54 @@ function formatViewResult(verb: string, view: NotionViewObject): string {
 
 function textErr(text: string): ToolResult {
   return { isError: true, content: [{ type: "text", text }] };
+}
+
+/** Does this directive set reference properties in slots that Notion's view
+ *  API wants an id (not a name)? FILTER/SORT take names; everything else on
+ *  the configuration object takes property_id. */
+function directivesNeedIdResolution(directives: DirectiveAst[]): boolean {
+  for (const d of directives) {
+    switch (d.kind) {
+      case "filter":
+      case "sort":
+      case "form":
+        continue;
+      case "group_by":
+      case "calendar_by":
+      case "timeline_by":
+      case "map_by":
+      case "chart":
+      case "show":
+        return true;
+      case "cover":
+        if (d.cover.kind === "property") return true;
+        continue;
+    }
+  }
+  return false;
+}
+
+/** Build a resolver (name → property_id) from a data source's `properties`
+ *  map. Throws a helpful EmitError if a name isn't present. */
+function makeResolverFromProperties(properties: Record<string, unknown>): (name: string) => string {
+  const map: Record<string, string> = {};
+  for (const [name, v] of Object.entries(properties ?? {})) {
+    if (v && typeof v === "object") {
+      const vv = v as { id?: unknown };
+      if (typeof vv.id === "string" && vv.id) map[name] = vv.id;
+    }
+  }
+  const available = Object.keys(map);
+  return (name: string) => {
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name]!;
+    // If the "name" is already an id we know about (values of the map), pass
+    // through — lets callers mix ids and names in one DSL without friction.
+    for (const id of Object.values(map)) {
+      if (id === name) return name;
+    }
+    throw new EmitError(
+      `property "${name}" not found on the view's data source. ` +
+        `Available property names: ${available.map((n) => `"${n}"`).join(", ") || "(none)"}.`
+    );
+  };
 }

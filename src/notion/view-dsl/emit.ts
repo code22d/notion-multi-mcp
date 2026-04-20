@@ -60,6 +60,13 @@ export interface EmitContext {
    *  defaults. Today the shapes overlap enough that we don't distinguish;
    *  kept as a flag for forward-compat. */
   forUpdate?: boolean;
+  /** Optional: resolve a property NAME (the thing the user typed in the DSL)
+   *  into the property ID Notion actually wants on every `property_id` /
+   *  `date_property_id` / `map_by` / `end_date_property_id` / `x_axis_property_id`
+   *  slot. Notion's filter/sort APIs accept names, but its view-configuration
+   *  APIs require IDs. Handlers fetch the data source and pass a resolver here.
+   *  If omitted (e.g. in unit tests), property names pass through unchanged. */
+  resolvePropertyId?: (name: string) => string;
 }
 
 /** Emitted body — a subset of CreateViewRequest / UpdateViewRequest fields. */
@@ -171,10 +178,18 @@ export function emitViewBody(directives: DirectiveAst[], ctx: EmitContext): Emit
       form,
       showProps,
       cover,
-    });
+    }, ctx);
   }
 
   return out;
+}
+
+/** Resolve a property name to its property_id via the context's resolver, if
+ *  provided. Otherwise, pass the name through unchanged — useful for unit
+ *  tests. Tool handlers always pass a real resolver so Notion's API accepts
+ *  the request. */
+function resolvePropId(ctx: EmitContext, name: string): string {
+  return ctx.resolvePropertyId ? ctx.resolvePropertyId(name) : name;
 }
 
 // -----------------------------------------------------------------------------
@@ -408,12 +423,12 @@ interface ConfigInputs {
   cover?: CoverAst;
 }
 
-function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedConfiguration {
+function emitConfiguration(viewType: ViewType, inputs: ConfigInputs, ctx: EmitContext): EmittedConfiguration {
   const cfg: EmittedConfiguration = { type: viewType };
   switch (viewType) {
     case "table": {
-      applyPropertiesList(cfg, inputs.showProps);
-      if (inputs.groupBy) cfg.group_by = emitGroupBy(inputs.groupBy.property, inputs.groupBy.propertyType);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
+      if (inputs.groupBy) cfg.group_by = emitGroupBy(inputs.groupBy.property, inputs.groupBy.propertyType, ctx);
       forbidIrrelevant(viewType, inputs, ["calendarBy", "timelineBy", "mapBy", "chart", "form", "cover"]);
       break;
     }
@@ -421,14 +436,14 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
       if (!inputs.groupBy) {
         throw new EmitError("board view requires a GROUP BY directive");
       }
-      cfg.group_by = emitGroupBy(inputs.groupBy.property, inputs.groupBy.propertyType);
-      if (inputs.cover) applyCover(cfg, inputs.cover);
-      applyPropertiesList(cfg, inputs.showProps);
+      cfg.group_by = emitGroupBy(inputs.groupBy.property, inputs.groupBy.propertyType, ctx);
+      if (inputs.cover) applyCover(cfg, inputs.cover, ctx);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
       forbidIrrelevant(viewType, inputs, ["calendarBy", "timelineBy", "mapBy", "chart", "form"]);
       break;
     }
     case "list": {
-      applyPropertiesList(cfg, inputs.showProps);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "calendarBy", "timelineBy", "mapBy", "chart", "form", "cover"]);
       break;
     }
@@ -436,8 +451,8 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
       if (!inputs.calendarBy) {
         throw new EmitError("calendar view requires a CALENDAR BY directive");
       }
-      cfg.date_property_id = inputs.calendarBy.property;
-      applyPropertiesList(cfg, inputs.showProps);
+      cfg.date_property_id = resolvePropId(ctx, inputs.calendarBy.property);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "timelineBy", "mapBy", "chart", "form", "cover"]);
       break;
     }
@@ -445,15 +460,17 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
       if (!inputs.timelineBy) {
         throw new EmitError("timeline view requires a TIMELINE BY directive");
       }
-      cfg.date_property_id = inputs.timelineBy.start;
-      if (inputs.timelineBy.end !== undefined) cfg.end_date_property_id = inputs.timelineBy.end;
-      applyPropertiesList(cfg, inputs.showProps);
+      cfg.date_property_id = resolvePropId(ctx, inputs.timelineBy.start);
+      if (inputs.timelineBy.end !== undefined) {
+        cfg.end_date_property_id = resolvePropId(ctx, inputs.timelineBy.end);
+      }
+      applyPropertiesList(cfg, inputs.showProps, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "calendarBy", "mapBy", "chart", "form", "cover"]);
       break;
     }
     case "gallery": {
-      applyPropertiesList(cfg, inputs.showProps);
-      if (inputs.cover) applyCover(cfg, inputs.cover);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
+      if (inputs.cover) applyCover(cfg, inputs.cover, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "calendarBy", "timelineBy", "mapBy", "chart", "form"]);
       break;
     }
@@ -461,8 +478,8 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
       if (!inputs.mapBy) {
         throw new EmitError("map view requires a MAP BY directive");
       }
-      cfg.map_by = inputs.mapBy.property;
-      applyPropertiesList(cfg, inputs.showProps);
+      cfg.map_by = resolvePropId(ctx, inputs.mapBy.property);
+      applyPropertiesList(cfg, inputs.showProps, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "calendarBy", "timelineBy", "chart", "form", "cover"]);
       break;
     }
@@ -475,7 +492,7 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
       if (!inputs.chart) {
         throw new EmitError("chart view requires a CHART directive");
       }
-      applyChart(cfg, inputs.chart);
+      applyChart(cfg, inputs.chart, ctx);
       forbidIrrelevant(viewType, inputs, ["groupBy", "calendarBy", "timelineBy", "mapBy", "form", "cover", "showProps"]);
       break;
     }
@@ -492,16 +509,16 @@ function emitConfiguration(viewType: ViewType, inputs: ConfigInputs): EmittedCon
   return cfg;
 }
 
-function applyPropertiesList(cfg: EmittedConfiguration, showProps: string[] | undefined): void {
+function applyPropertiesList(cfg: EmittedConfiguration, showProps: string[] | undefined, ctx: EmitContext): void {
   if (!showProps || showProps.length === 0) return;
-  cfg.properties = showProps.map((name) => ({ property_id: name, visible: true }));
+  cfg.properties = showProps.map((name) => ({ property_id: resolvePropId(ctx, name), visible: true }));
 }
 
-function applyCover(cfg: EmittedConfiguration, cover: CoverAst): void {
+function applyCover(cfg: EmittedConfiguration, cover: CoverAst, ctx: EmitContext): void {
   switch (cover.kind) {
     case "page_cover":   cfg.cover = { type: "page_cover" }; break;
     case "page_content": cfg.cover = { type: "page_content" }; break;
-    case "property":     cfg.cover = { type: "property", property_id: cover.property }; break;
+    case "property":     cfg.cover = { type: "property", property_id: resolvePropId(ctx, cover.property) }; break;
   }
 }
 
@@ -511,27 +528,27 @@ function applyForm(cfg: EmittedConfiguration, form: FormAst): void {
   if (form.permissions !== undefined) cfg.submission_permissions = form.permissions;
 }
 
-function applyChart(cfg: EmittedConfiguration, chart: ChartAst): void {
+function applyChart(cfg: EmittedConfiguration, chart: ChartAst, ctx: EmitContext): void {
   cfg.chart_type = chart.chartType;
   if (chart.aggregator !== undefined) {
     const value: Record<string, unknown> = { aggregator: chart.aggregator };
-    if (chart.aggregatorProperty !== undefined) value.property_id = chart.aggregatorProperty;
+    if (chart.aggregatorProperty !== undefined) value.property_id = resolvePropId(ctx, chart.aggregatorProperty);
     cfg.value = value;
     cfg.y_axis = value;
   }
   if (chart.xAxisProperty !== undefined) {
-    cfg.x_axis_property_id = chart.xAxisProperty;
+    cfg.x_axis_property_id = resolvePropId(ctx, chart.xAxisProperty);
   }
   if (chart.height !== undefined) {
     cfg.height = chart.height;
   }
 }
 
-function emitGroupBy(property: string, propertyType: GroupByPropertyType | undefined): Record<string, unknown> {
+function emitGroupBy(property: string, propertyType: GroupByPropertyType | undefined, ctx: EmitContext): Record<string, unknown> {
   const type: GroupByPropertyType = propertyType ?? "select";
   const base: Record<string, unknown> = {
     type,
-    property_id: property,
+    property_id: resolvePropId(ctx, property),
     sort: { type: "manual" },
   };
   // Type-specific required sub-group_by keys.

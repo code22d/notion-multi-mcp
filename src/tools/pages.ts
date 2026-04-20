@@ -178,8 +178,26 @@ interface NormalizedParent {
 }
 
 function normalizeParent(raw: unknown): NormalizedParent | null {
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Record<string, unknown>;
+  // Accept either a parsed object or a JSON-string, defensively — some MCP
+  // clients serialize object-typed args as strings (observed on optional
+  // object args through the Cowork transport).
+  let r: Record<string, unknown> | null = null;
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    r = raw as Record<string, unknown>;
+  } else if (typeof raw === "string") {
+    const s = raw.trim();
+    if (s.startsWith("{") && s.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(s);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          r = parsed as Record<string, unknown>;
+        }
+      } catch {
+        /* fall through to null */
+      }
+    }
+  }
+  if (!r) return null;
   if (typeof r.page_id === "string" && r.page_id) {
     return { type: "page_id", page_id: stripDashes(r.page_id) };
   }

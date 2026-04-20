@@ -13,7 +13,16 @@ export interface ViewFixture {
   /** Expected subset of the emitted EmittedViewBody — supports nested objects,
    *  arrays, and `undefined` sentinel (key must be absent). */
   expected: Record<string, unknown>;
+  /** Optional resolver: when present, the emit harness will pass a resolver
+   *  built from this map so property names rewrite to ids. Used to verify the
+   *  follow-up #1 fix. */
+  propIds?: Record<string, string>;
 }
+
+/** Optional fixture field — a property-name-to-id resolver. If present, the
+ *  test harness passes it into emitViewBody so we can verify that names are
+ *  rewritten into ids. Not all fixtures need it (filter/sort-only ones don't). */
+export type PropIdMap = Record<string, string>;
 
 export const VIEW_FIXTURES: ViewFixture[] = [
   // ---- Filters ----
@@ -305,6 +314,66 @@ GROUP BY STATUS "Lifecycle"`,
     },
   },
 
+  // ---- Resolver (property name → property_id) ----
+  {
+    name: "resolver rewrites GROUP BY property name to id",
+    dsl: `GROUP BY SELECT "Status"`,
+    viewType: "board",
+    propIds: { Status: "%7B%3FQf" },
+    expected: {
+      configuration: {
+        type: "board",
+        group_by: {
+          type: "select",
+          property_id: "%7B%3FQf",
+          sort: { type: "manual" },
+        },
+      },
+    },
+  },
+  {
+    name: "resolver rewrites CALENDAR BY, TIMELINE BY, MAP BY, and SHOW",
+    dsl: `CALENDAR BY "Due"`,
+    viewType: "calendar",
+    propIds: { Due: "xH%3Ex", Name: "title" },
+    expected: {
+      configuration: {
+        type: "calendar",
+        date_property_id: "xH%3Ex",
+      },
+    },
+  },
+  {
+    name: "resolver rewrites CHART aggregator property",
+    dsl: `CHART column AGGREGATE sum OF "Priority" HEIGHT medium`,
+    viewType: "chart",
+    propIds: { Priority: "iTc%7C" },
+    expected: {
+      configuration: {
+        type: "chart",
+        chart_type: "column",
+        y_axis: { aggregator: "sum", property_id: "iTc%7C" },
+        height: "medium",
+      },
+    },
+  },
+  {
+    name: "resolver passes through when an id is already supplied",
+    dsl: `GROUP BY SELECT "%7B%3FQf"`,
+    viewType: "board",
+    propIds: { Status: "%7B%3FQf" },
+    expected: {
+      configuration: {
+        type: "board",
+        group_by: {
+          type: "select",
+          property_id: "%7B%3FQf",
+          sort: { type: "manual" },
+        },
+      },
+    },
+  },
+
   // ---- Comments + trailing whitespace ----
   {
     name: "line comments and trailing semicolons",
@@ -325,6 +394,9 @@ export interface ViewErrorFixture {
   dsl: string;
   viewType?: ViewType;
   expectMessageMatches: RegExp;
+  /** Optional resolver — if present, harness wires it in so we can test the
+   *  "property not found" error path. */
+  propIds?: Record<string, string>;
 }
 
 export const VIEW_ERROR_FIXTURES: ViewErrorFixture[] = [
@@ -389,5 +461,12 @@ FILTER "B" = "y"`,
     dsl: `CALENDAR BY "Due"`,
     // no viewType — emulates UPDATE path where the handler hasn't fetched
     expectMessageMatches: /view type must be known/,
+  },
+  {
+    name: "resolver rejects unknown property name with helpful list",
+    dsl: `GROUP BY SELECT "NotAProperty"`,
+    viewType: "board",
+    propIds: { Status: "%7B%3FQf", Priority: "iTc%7C" },
+    expectMessageMatches: /property "NotAProperty" not found.*"Status".*"Priority"/s,
   },
 ];

@@ -387,11 +387,37 @@ interface NormalizedParent {
 }
 
 function normalizeParent(raw: unknown): NormalizedParent | null {
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Record<string, unknown>;
-  if (typeof r.page_id === "string" && r.page_id) return { type: "page_id", page_id: r.page_id };
-  if (typeof r.database_id === "string" && r.database_id) return { type: "database_id", database_id: r.database_id };
-  if (typeof r.data_source_id === "string" && r.data_source_id) return { type: "data_source_id", data_source_id: r.data_source_id };
+  // Object-typed tool args are normally delivered pre-parsed by the MCP
+  // transport, but some clients serialize them as a JSON string instead —
+  // accept either form so the DSL works regardless of how the caller wrapped
+  // the value.
+  const obj = coerceToObject(raw);
+  if (!obj) return null;
+  if (typeof obj.page_id === "string" && obj.page_id) return { type: "page_id", page_id: obj.page_id };
+  if (typeof obj.database_id === "string" && obj.database_id) return { type: "database_id", database_id: obj.database_id };
+  if (typeof obj.data_source_id === "string" && obj.data_source_id) return { type: "data_source_id", data_source_id: obj.data_source_id };
+  return null;
+}
+
+/** Parse object-or-JSON-string into a plain object, or return null on
+ *  anything else. Exported for unit tests. */
+export function coerceToObject(raw: unknown): Record<string, unknown> | null {
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    return raw as Record<string, unknown>;
+  }
+  if (typeof raw === "string") {
+    const s = raw.trim();
+    if (s.startsWith("{") && s.endsWith("}")) {
+      try {
+        const parsed = JSON.parse(s);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        return null;
+      }
+    }
+  }
   return null;
 }
 
@@ -489,7 +515,9 @@ async function moveHandler(args: Record<string, unknown>, ctx: ToolContext): Pro
   const client = new NotionClient(account);
 
   const ids = Array.isArray(args.page_or_database_ids) ? (args.page_or_database_ids as string[]) : [];
-  const parent = args.new_parent as Record<string, unknown> | undefined;
+  // Accept object OR JSON-string for new_parent, matching normalizeParent's
+  // defensive behaviour for duplicate_page.
+  const parent = coerceToObject(args.new_parent);
   if (ids.length === 0) return textErr("`page_or_database_ids` must have at least one id.");
   if (!parent || !parent.type) return textErr("`new_parent` is required and must have a `type`.");
 

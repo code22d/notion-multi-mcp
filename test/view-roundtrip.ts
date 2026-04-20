@@ -76,7 +76,11 @@ for (const fx of VIEW_FIXTURES) {
   console.log(`\n[view] ${fx.name}`);
   try {
     const directives = parseViewDsl(fx.dsl);
-    const body = emitViewBody(directives, { viewType: fx.viewType });
+    const resolver = fx.propIds ? makeResolver(fx.propIds) : undefined;
+    const body = emitViewBody(directives, {
+      viewType: fx.viewType,
+      ...(resolver ? { resolvePropertyId: resolver } : {}),
+    });
     const errors = deepSubset(body, fx.expected, "body");
     if (errors.length === 0) {
       assert(true, "emitted body matches expected shape");
@@ -86,6 +90,23 @@ for (const fx of VIEW_FIXTURES) {
   } catch (e) {
     assert(false, `unexpected error: ${e instanceof Error ? e.message : String(e)}`);
   }
+}
+
+/** Build a resolver that mirrors the handler's behaviour: map hit → return
+ *  id; value-is-already-an-id → pass through; otherwise throw with a list of
+ *  known names. */
+function makeResolver(map: Record<string, string>): (name: string) => string {
+  const available = Object.keys(map);
+  return (name: string) => {
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name]!;
+    for (const id of Object.values(map)) {
+      if (id === name) return name;
+    }
+    throw new Error(
+      `property "${name}" not found on the view's data source. ` +
+        `Available property names: ${available.map((n) => `"${n}"`).join(", ") || "(none)"}.`
+    );
+  };
 }
 
 // -----------------------------------------------------------------------------
@@ -99,7 +120,10 @@ for (const fx of VIEW_ERROR_FIXTURES) {
   let message = "";
   try {
     const directives = parseViewDsl(fx.dsl);
-    emitViewBody(directives, fx.viewType ? { viewType: fx.viewType } : {});
+    const emitCtx: Parameters<typeof emitViewBody>[1] = {};
+    if (fx.viewType) emitCtx.viewType = fx.viewType;
+    if (fx.propIds) emitCtx.resolvePropertyId = makeResolver(fx.propIds);
+    emitViewBody(directives, emitCtx);
   } catch (e) {
     threw = true;
     message = e instanceof Error ? e.message : String(e);

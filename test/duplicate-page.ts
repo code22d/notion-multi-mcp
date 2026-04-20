@@ -9,7 +9,7 @@
 // (where supported), and stripped server-only fields.
 // -----------------------------------------------------------------------------
 
-import { toBlockRequest, type HydratedBlock, type BlockRequest } from "../src/tools/duplicate-move.ts";
+import { toBlockRequest, coerceToObject, type HydratedBlock, type BlockRequest } from "../src/tools/duplicate-move.ts";
 
 let passed = 0;
 let failed = 0;
@@ -179,6 +179,45 @@ console.log("\n=== duplicate_page: toBlockRequest ===");
   const colBody = (colReq as Record<string, unknown>).column as { children?: BlockRequest[] } | undefined;
   assert(Array.isArray(colBody?.children) && colBody!.children!.length === 1, "column has one child");
   assert(colBody!.children![0]!.type === "paragraph", "leaf is a paragraph");
+}
+
+// -----------------------------------------------------------------------------
+// coerceToObject (object-or-JSON-string fallback)
+// -----------------------------------------------------------------------------
+
+console.log("\n=== duplicate_page: coerceToObject ===");
+
+{
+  const out = coerceToObject({ page_id: "abc" });
+  assert(out !== null && out.page_id === "abc", "passes a real object through");
+}
+{
+  const out = coerceToObject('{"page_id": "abc"}');
+  assert(out !== null && out.page_id === "abc", "parses a JSON-string object");
+}
+{
+  const out = coerceToObject('  {"database_id": "xyz"}  ');
+  assert(out !== null && out.database_id === "xyz", "tolerates surrounding whitespace");
+}
+{
+  const out = coerceToObject("not json");
+  assert(out === null, "non-JSON string returns null");
+}
+{
+  const out = coerceToObject("[1,2,3]");
+  assert(out === null, "JSON array is not treated as an object");
+}
+{
+  const out = coerceToObject(undefined);
+  assert(out === null, "undefined returns null");
+}
+{
+  const out = coerceToObject(null);
+  assert(out === null, "null returns null");
+}
+{
+  const out = coerceToObject(42);
+  assert(out === null, "non-object non-string returns null");
 }
 
 // -----------------------------------------------------------------------------
