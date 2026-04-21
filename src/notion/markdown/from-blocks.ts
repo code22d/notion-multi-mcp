@@ -50,6 +50,38 @@ export function blocksToMarkdown(blocks: HydratedBlock[] | undefined, opts: From
   return renderSiblings(blocks, ctx);
 }
 
+/**
+ * Source-mapped variant of blocksToMarkdown. Produces the same markdown string
+ * plus a span per TOP-LEVEL block recording the `[startOffset, endOffset)`
+ * range that block contributed. Nested children are rendered inside their
+ * parent's span; the span boundaries for a toggle/callout/list-item cover
+ * every character of the block's rendering, including its children.
+ *
+ * Used by update_content (Phase 5.5) to map a substitution's match-range back
+ * to the block(s) it overlaps — the input to fast/medium/full path dispatch.
+ */
+export function blocksToMarkdownWithSpans(
+  blocks: HydratedBlock[] | undefined,
+  opts: FromBlocksOptions = {}
+): { markdown: string; blockSpans: BlockSpan[] } {
+  if (!blocks || blocks.length === 0) return { markdown: "", blockSpans: [] };
+  const ctx: Ctx = { indent: opts.indent ?? "", listCounters: new Map() };
+  return renderSiblingsWithSpans(blocks, ctx);
+}
+
+export interface BlockSpan {
+  /** Char offset in the rendered markdown (inclusive). */
+  startOffset: number;
+  /** Char offset in the rendered markdown (exclusive). */
+  endOffset: number;
+  /** The block's own id (from the Notion API response). */
+  blockId: string;
+  /** The block's `type` field — convenient for fast-path dispatch. */
+  blockType: string;
+  /** The source block — handy when callers need the full payload. */
+  block: HydratedBlock;
+}
+
 function renderSiblings(blocks: HydratedBlock[], ctx: Ctx): string {
   const parts: string[] = [];
   let prevType: string | null = null;
@@ -66,6 +98,46 @@ function renderSiblings(blocks: HydratedBlock[], ctx: Ctx): string {
   // Reset counters left from the last run.
   ctx.listCounters.delete(ctx.indent);
   return parts.join("\n\n");
+}
+
+/**
+ * Same structural walk as renderSiblings, but builds a span for every block
+ * whose renderer returned a non-null string. Offsets match what `parts.join("\n\n")`
+ * would produce: the N-th non-null part lives at
+ *   `offset(parts.slice(0, N).join("\n\n").length + (N > 0 ? 2 : 0))`.
+ */
+function renderSiblingsWithSpans(
+  blocks: HydratedBlock[],
+  ctx: Ctx
+): { markdown: string; blockSpans: BlockSpan[] } {
+  const parts: string[] = [];
+  const spans: BlockSpan[] = [];
+  let runningLen = 0;
+  let prevType: string | null = null;
+  for (let i = 0; i < blocks.length; i++) {
+    const b = blocks[i]!;
+    if (b.type !== "numbered_list_item" && prevType === "numbered_list_item") {
+      ctx.listCounters.delete(ctx.indent);
+    }
+    const rendered = renderBlock(b, ctx);
+    prevType = b.type;
+    if (rendered === null) continue;
+    // A separator ("\n\n") is inserted BEFORE this part whenever a prior part
+    // has already been pushed — exactly the semantics of array.join.
+    if (parts.length > 0) runningLen += 2;
+    const startOffset = runningLen;
+    parts.push(rendered);
+    runningLen += rendered.length;
+    spans.push({
+      startOffset,
+      endOffset: runningLen,
+      blockId: b.id,
+      blockType: b.type,
+      block: b,
+    });
+  }
+  ctx.listCounters.delete(ctx.indent);
+  return { markdown: parts.join("\n\n"), blockSpans: spans };
 }
 
 function renderBlock(block: HydratedBlock, ctx: Ctx): string | null {

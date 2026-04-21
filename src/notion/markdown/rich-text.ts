@@ -49,7 +49,11 @@ function oneToMarkdown(r: NotionRichText): string {
     return label;
   }
 
-  let text = r.plain_text ?? "";
+  // Prefer plain_text (set by Notion on response-shape runs) but fall back to
+  // text.content so this function also works on request-shape runs emitted by
+  // markdownToBlocks — the diff planner in update-page renders both shapes
+  // for alignment.
+  let text = r.plain_text ?? r.text?.content ?? "";
   const ann = r.annotations ?? {};
   if (ann.code) text = "`" + text + "`";
   if (ann.bold) text = "**" + text + "**";

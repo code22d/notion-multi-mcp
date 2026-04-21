@@ -1,7 +1,6 @@
 // -----------------------------------------------------------------------------
 // Page tools — notion_create_pages (Phase 2 real handler) and
-// notion_update_page (still a Phase 2 stub; arriving in a follow-up session
-// once the Markdown diff engine is spec'd out).
+// notion_update_page (Phase 5 real handler, see ./update-page/).
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
@@ -9,7 +8,7 @@ import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../accounts/resolver";
 import { NotionClient, stripDashes, type NotionPageObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 import { markdownToBlocks, type BlockRequest } from "../notion/markdown/to-blocks";
-import { notYetImplemented } from "./_stub";
+import { updatePageHandler, UPDATE_PAGE_INPUT_SCHEMA } from "./update-page";
 
 const CHILDREN_PER_REQUEST = 100;
 
@@ -64,30 +63,13 @@ export function registerPageTools(register: (def: ToolDef) => void): void {
   register({
     name: "notion_update_page",
     description:
-      "Update a Notion page on the specified account — properties, content, cover, icon, template application, or verification status. [Phase 2 — pending]",
-    inputSchema: {
-      type: "object",
-      properties: {
-        ...ACCOUNT_PARAM_SCHEMA,
-        page_id: { type: "string" },
-        command: {
-          type: "string",
-          enum: ["update_properties", "update_content", "replace_content", "apply_template", "update_verification"],
-        },
-        properties: { type: "object" },
-        content_updates: { type: "array" },
-        new_str: { type: "string" },
-        template_id: { type: "string" },
-        cover: { type: "string" },
-        icon: { type: "string" },
-        verification_status: { type: "string", enum: ["verified", "unverified"] },
-        verification_expiry_days: { type: "integer" },
-        allow_deleting_content: { type: "boolean" },
-      },
-      required: ["account", "page_id", "command"],
-      additionalProperties: false,
-    },
-    handler: notYetImplemented(2, "Requires Markdown diff/replace engine to match native search-and-replace semantics."),
+      "Update a Notion page on the specified account. Dispatches on `command`: `update_properties` " +
+      "(patch property values, cover, icon, archive state), `update_content` (search-and-replace against " +
+      "the page's Notion-flavored Markdown), `replace_content` (rewrite the whole body from Markdown), " +
+      "`apply_template` (clone blocks from another page onto this one), `update_verification` " +
+      "(set verified/unverified with optional expiry).",
+    inputSchema: UPDATE_PAGE_INPUT_SCHEMA as unknown as Record<string, unknown>,
+    handler: updatePageHandler,
   });
 }
 
