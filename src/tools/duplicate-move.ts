@@ -59,7 +59,8 @@ export function registerDuplicateAndMoveTools(register: (def: ToolDef) => void):
 
   register({
     name: "notion_move_pages",
-    description: "Move one or more Notion pages/databases to a new parent on the specified account.",
+    description:
+      "Move one or more Notion pages/databases to a new parent on the specified account. Uses Notion's POST /pages/{id}/move endpoint, which accepts only `page_id` or `data_source_id` parents; `database_id` is auto-resolved to the database's first data source. `workspace` parents are not supported by Notion's public API.",
     inputSchema: {
       type: "object",
       properties: {
@@ -67,7 +68,8 @@ export function registerDuplicateAndMoveTools(register: (def: ToolDef) => void):
         page_or_database_ids: { type: "array", items: { type: "string" }, minItems: 1, maxItems: 100 },
         new_parent: {
           type: "object",
-          description: "New parent: { type: 'page_id' | 'database_id' | 'data_source_id' | 'workspace', ... }",
+          description:
+            "New parent: { type: 'page_id' | 'database_id' | 'data_source_id', ... }. `database_id` is auto-resolved to the database's default data source. `workspace` is rejected with a clear error — public API limitation.",
         },
       },
       required: ["account", "page_or_database_ids", "new_parent"],
@@ -515,23 +517,124 @@ async function moveHandler(args: Record<string, unknown>, ctx: ToolContext): Pro
   const client = new NotionClient(account);
 
   const ids = Array.isArray(args.page_or_database_ids) ? (args.page_or_database_ids as string[]) : [];
-  // Accept object OR JSON-string for new_parent, matching normalizeParent's
-  // defensive behaviour for duplicate_page.
   const parent = coerceToObject(args.new_parent);
   if (ids.length === 0) return textErr("`page_or_database_ids` must have at least one id.");
   if (!parent || !parent.type) return textErr("`new_parent` is required and must have a `type`.");
 
+  // Notion's POST /pages/{id}/move accepts only page_id or data_source_id
+  // parents. Translate database_id → the database's first data_source_id,
+  // and reject workspace parents with a clear error.
+  let movePayload: { page_id?: string; data_source_id?: string; type?: "page_id" | "data_source_id" };
+  try {
+    movePayload = await resolveMoveTarget(client, parent);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return textErr(`notion_move_pages: ${msg}`);
+  }
+
   const results: string[] = [];
   for (const id of ids) {
     try {
-      const updated = await client.updatePage(id, { parent });
-      results.push(`✅ Moved ${id} → parent ${JSON.stringify(parent)} (now at ${updated.url})`);
+      const moved = await client.movePage(id, { parent: movePayload });
+      // Post-verify: Notion has, in the past, returned 200 from /move even
+      // when the move didn't actually land (especially on unsupported parent
+      // combinations). Assert the returned parent matches what we asked for.
+      if (!parentMatches(moved.parent, movePayload)) {
+        results.push(
+          `⚠ ${id}: Notion returned 200 but the page's parent is still ${JSON.stringify(moved.parent)} ` +
+            `(expected ${JSON.stringify(movePayload)}). Check workspace permissions / page type.`
+        );
+      } else {
+        results.push(`✅ Moved ${id} → ${JSON.stringify(movePayload)} (url: ${moved.url})`);
+      }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       results.push(`❌ ${id}: ${msg}`);
     }
   }
-  return { content: [{ type: "text", text: results.join("\n") }] };
+  const allFailed = results.every((r) => r.startsWith("❌") || r.startsWith("⚠"));
+  return {
+    content: [{ type: "text", text: results.join("\n") }],
+    ...(allFailed ? { isError: true } : {}),
+  };
+}
+
+/**
+ * Translate the tool-level `new_parent` shape into the /move endpoint's
+ * accepted body.
+ *
+ *   { type: "page_id", page_id }                 → passthrough
+ *   { type: "data_source_id", data_source_id }   → passthrough
+ *   { type: "database_id", database_id }         → fetch DB, use its first data_source_id
+ *   { type: "workspace" }                        → reject
+ *
+ * Throws with a helpful message if the translation isn't possible.
+ */
+async function resolveMoveTarget(
+  client: NotionClient,
+  parent: Record<string, unknown>
+): Promise<{ page_id?: string; data_source_id?: string; type?: "page_id" | "data_source_id" }> {
+  const t = String(parent.type);
+  if (t === "page_id") {
+    const pageId = typeof parent.page_id === "string" ? parent.page_id : "";
+    if (!pageId) throw new Error(`new_parent.page_id is required when type is "page_id"`);
+    return { type: "page_id", page_id: pageId };
+  }
+  if (t === "data_source_id") {
+    const dsId = typeof parent.data_source_id === "string" ? parent.data_source_id : "";
+    if (!dsId) throw new Error(`new_parent.data_source_id is required when type is "data_source_id"`);
+    return { type: "data_source_id", data_source_id: dsId };
+  }
+  if (t === "database_id") {
+    const dbId = typeof parent.database_id === "string" ? parent.database_id : "";
+    if (!dbId) throw new Error(`new_parent.database_id is required when type is "database_id"`);
+    // Notion's API removed database_id as a move destination in 2025-09-03;
+    // resolve to the database's first data source instead.
+    const db = await client.getDatabase(dbId);
+    const ds = db.data_sources?.[0];
+    if (!ds || !ds.id) {
+      throw new Error(
+        `database "${dbId}" has no data_sources — pass a specific data_source_id instead.`
+      );
+    }
+    return { type: "data_source_id", data_source_id: ds.id };
+  }
+  if (t === "workspace") {
+    throw new Error(
+      `moves to the workspace root are not supported by Notion's public API — move the page to a parent page or data source instead.`
+    );
+  }
+  throw new Error(`unknown new_parent.type "${t}" — expected "page_id", "database_id", "data_source_id", or "workspace"`);
+}
+
+/** Does the returned page parent match what we asked for? */
+function parentMatches(
+  got: { type?: string; page_id?: unknown; data_source_id?: unknown; database_id?: unknown; [k: string]: unknown } | undefined,
+  asked: { page_id?: string; data_source_id?: string; type?: "page_id" | "data_source_id" }
+): boolean {
+  if (!got) return false;
+  if (asked.type === "page_id") {
+    if (got.type !== "page_id") return false;
+    return idsEqual(String(got.page_id ?? ""), asked.page_id ?? "");
+  }
+  if (asked.type === "data_source_id") {
+    // Some pages under a data source come back with type "database_id" /
+    // database_id set to the wrapping database; accept either shape as long
+    // as the ids roll up correctly.
+    if (got.type === "data_source_id") {
+      return idsEqual(String(got.data_source_id ?? ""), asked.data_source_id ?? "");
+    }
+    if (got.type === "database_id") {
+      // Can't fully check without another fetch; accept as a soft match.
+      return true;
+    }
+    return false;
+  }
+  return false;
+}
+
+function idsEqual(a: string, b: string): boolean {
+  return a.replace(/-/g, "") === b.replace(/-/g, "");
 }
 
 function textErr(text: string): ToolResult {

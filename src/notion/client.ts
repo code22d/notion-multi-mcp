@@ -167,6 +167,20 @@ export class NotionClient {
     return this.request<NotionPageObject>(`/pages/${stripDashes(pageId)}`, { method: "PATCH", body });
   }
 
+  /**
+   * POST /v1/pages/{id}/move — Notion's dedicated move endpoint.
+   *
+   * IMPORTANT: /pages/{id}/move accepts ONLY `{ parent: { page_id } }` or
+   * `{ parent: { data_source_id } }`. The PATCH /pages endpoint's body
+   * whitelist does NOT include `parent`, so using PATCH for moves silently
+   * no-ops the parent field and returns the page with its old parent — which
+   * the caller will then mistake for success. Always use this endpoint for
+   * moves and post-verify with getPage if you want to be certain it took.
+   */
+  movePage(pageId: string, body: unknown): Promise<NotionPageObject> {
+    return this.request<NotionPageObject>(`/pages/${stripDashes(pageId)}/move`, { method: "POST", body });
+  }
+
   /** POST /v1/blocks/{parent_id}/children — append. */
   appendBlockChildren(blockId: string, body: unknown): Promise<PaginatedList<NotionBlockObject>> {
     return this.request<PaginatedList<NotionBlockObject>>(`/blocks/${stripDashes(blockId)}/children`, {
