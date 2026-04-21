@@ -2,15 +2,35 @@
 // KV-backed account store.
 //
 // KV layout:
-//   account:{id}            → NotionAccount JSON
-//   name_index:{lc_name}    → id (lowercased-name uniqueness index for fast lookup)
-//   accounts                → array of AccountSummary (cached list; rebuilt on every mutation)
+//   account:{id}            → NotionAccount JSON (source of truth for account data)
+//   name_index:{lc_name}    → id (lowercased-name uniqueness index + name lookup)
+//   accounts_dir            → JSON array of all account ids (strongly-consistent
+//                              directory used by list(); self-heals from
+//                              name_index: scan if missing/empty)
 //
-// Keeping a pre-built `accounts` list means `notion_account_list` is O(1) and
-// doesn't need a KV prefix scan. We pay the cost on writes instead, which are rare.
+// History:
+//   - V1 maintained an `accounts` key caching the full pre-built summary list.
+//     That cache went stale across deploys and was a known source of under-reports.
+//   - V2 removed the cache entirely; list() derived from a `name_index:` prefix
+//     scan. Cleaner code but exposed a Cloudflare KV characteristic: list()
+//     operations are eventually consistent across regions with a window up to
+//     60 seconds. Cold reads shortly after an add/rename would under-report.
+//   - V3 (this file) uses `accounts_dir` — a single strongly-consistent key
+//     read via get() — as the directory. get() has a much smaller consistency
+//     window (seconds) than list() (up to 60s), so cold reads converge fast.
+//     When accounts_dir is missing (first deploy of this code, or legitimately
+//     empty), list() self-heals by scanning name_index: and populating the
+//     directory for future reads. Writes (put/remove) keep the directory in
+//     sync; rename() doesn't need to touch it since the id is stable.
 // -----------------------------------------------------------------------------
 
 import type { AccountSummary, NotionAccount } from "../mcp/types";
+
+// One-time best-effort cleanup of the legacy cache key. We attempt the delete
+// on the first list() call per isolate — if the KV key never existed, the call
+// is a no-op; if it did, we tidy up. Either way this is fire-and-forget and
+// never blocks the main path.
+let legacyCacheCleanupAttempted = false;
 
 export class AccountStore {
   constructor(private kv: KVNamespace) {}
@@ -45,14 +65,76 @@ export class AccountStore {
     return this.getByName(nameOrId);
   }
 
+  /**
+   * Enumerate all accounts. Primary path reads the strongly-consistent
+   * `accounts_dir` directory via get(). If that's missing or empty, falls back
+   * to scanning name_index: (to self-heal during the first call after deploy
+   * of this version, or to recover from an inconsistent state) and populates
+   * accounts_dir for the next call.
+   */
   async list(): Promise<AccountSummary[]> {
-    const raw = await this.kv.get("accounts");
+    // Fire-and-forget tidy-up of the legacy `accounts` cache key. Safe if absent.
+    if (!legacyCacheCleanupAttempted) {
+      legacyCacheCleanupAttempted = true;
+      this.kv.delete("accounts").catch(() => {
+        /* ignore — best-effort cleanup */
+      });
+    }
+
+    let ids = await this.getDir();
+
+    // Self-heal: directory missing or empty — scan name_index: and rebuild.
+    // This runs once per deploy of this code (or after an unusual state),
+    // then every subsequent call hits the fast directory path.
+    if (ids.length === 0) {
+      const scanned = new Set<string>();
+      let cursor: string | undefined;
+      do {
+        const res = await this.kv.list({ prefix: "name_index:", cursor });
+        for (const k of res.keys) {
+          const id = await this.kv.get(k.name);
+          if (id) scanned.add(id);
+        }
+        cursor = res.list_complete ? undefined : res.cursor;
+      } while (cursor);
+
+      if (scanned.size > 0) {
+        ids = Array.from(scanned);
+        // Best-effort populate the directory for next read. Don't block.
+        this.putDir(ids).catch(() => {
+          /* ignore — next list() will retry self-heal */
+        });
+      }
+    }
+
+    const summaries: AccountSummary[] = [];
+    for (const id of ids) {
+      const acct = await this.getById(id);
+      if (acct) summaries.push(toSummary(acct));
+    }
+    summaries.sort((a, b) => a.name.localeCompare(b.name));
+    return summaries;
+  }
+
+  // -------------------------------------------------------------------
+  // Directory helpers (accounts_dir key — strongly-consistent enumeration)
+  // -------------------------------------------------------------------
+
+  private async getDir(): Promise<string[]> {
+    const raw = await this.kv.get("accounts_dir");
     if (!raw) return [];
     try {
-      return JSON.parse(raw) as AccountSummary[];
+      const parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? (parsed as string[]) : [];
     } catch {
       return [];
     }
+  }
+
+  private async putDir(ids: string[]): Promise<void> {
+    // Dedupe while preserving insertion order.
+    const unique = Array.from(new Set(ids));
+    await this.kv.put("accounts_dir", JSON.stringify(unique));
   }
 
   // -------------------------------------------------------------------
@@ -73,7 +155,14 @@ export class AccountStore {
 
     await this.kv.put(`account:${account.id}`, JSON.stringify(account));
     await this.kv.put(`name_index:${lc}`, account.id);
-    await this.rebuildList();
+
+    // Maintain the strongly-consistent directory so list() sees this account
+    // on its next call without waiting on list() consistency convergence.
+    const dir = await this.getDir();
+    if (!dir.includes(account.id)) {
+      dir.push(account.id);
+      await this.putDir(dir);
+    }
   }
 
   async rename(id: string, newName: string): Promise<NotionAccount> {
@@ -92,7 +181,6 @@ export class AccountStore {
     }
     const updated: NotionAccount = { ...account, name: newName };
     await this.kv.put(`account:${id}`, JSON.stringify(updated));
-    await this.rebuildList();
     return updated;
   }
 
@@ -101,45 +189,35 @@ export class AccountStore {
     if (!account) return null;
     await this.kv.delete(`account:${id}`);
     await this.kv.delete(`name_index:${normalizeName(account.name)}`);
-    await this.rebuildList();
+
+    // Drop from directory so list() stops returning it immediately.
+    const dir = await this.getDir();
+    const filtered = dir.filter((dirId) => dirId !== id);
+    if (filtered.length !== dir.length) {
+      await this.putDir(filtered);
+    }
     return account;
   }
+}
 
-  // -------------------------------------------------------------------
-  // Internal — rebuild cached summary list from the id index.
-  // -------------------------------------------------------------------
-
-  private async rebuildList(): Promise<void> {
-    // Walk all name_index keys to gather the authoritative set of accounts.
-    // Small scale (expected <50 accounts) so a simple scan is fine.
-    const ids: string[] = [];
-    let cursor: string | undefined;
-    do {
-      const res = await this.kv.list({ prefix: "name_index:", cursor });
-      for (const k of res.keys) {
-        const id = await this.kv.get(k.name);
-        if (id) ids.push(id);
-      }
-      cursor = res.list_complete ? undefined : res.cursor;
-    } while (cursor);
-
-    const summaries: AccountSummary[] = [];
-    for (const id of ids) {
-      const acct = await this.getById(id);
-      if (acct) {
-        summaries.push({
-          id: acct.id,
-          name: acct.name,
-          workspaceName: acct.workspaceName,
-          createdAt: acct.createdAt,
-        });
-      }
-    }
-    summaries.sort((a, b) => a.name.localeCompare(b.name));
-    await this.kv.put("accounts", JSON.stringify(summaries));
-  }
+function toSummary(account: NotionAccount): AccountSummary {
+  return {
+    id: account.id,
+    name: account.name,
+    workspaceName: account.workspaceName,
+    createdAt: account.createdAt,
+  };
 }
 
 export function normalizeName(name: string): string {
   return name.trim().toLowerCase();
+}
+
+/**
+ * Test hook: reset the one-time legacy-cache cleanup latch so unit tests can
+ * observe the `kv.delete("accounts")` call consistently. Not part of the public
+ * runtime contract — production code has no reason to reset.
+ */
+export function __resetLegacyCacheCleanupForTests(): void {
+  legacyCacheCleanupAttempted = false;
 }
