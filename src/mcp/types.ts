@@ -59,6 +59,24 @@ export interface NotionAccount {
   name: string;
   /** Notion OAuth access token. */
   accessToken: string;
+  /**
+   * Notion OAuth refresh token, when the connection issues one.
+   *
+   * OPTIONAL BY DESIGN. Internal integrations and public connections
+   * authorized before 2026-06-08 don't return one, and every account record
+   * written before this field existed lacks it. Absent must mean "this account
+   * cannot refresh" and behave exactly as it did before — never "refresh with
+   * an empty token".
+   */
+  refreshToken?: string;
+  /**
+   * Absolute expiry of `accessToken`, unix ms, derived from the `expires_in`
+   * the token endpoint returned. Also optional: Notion has historically issued
+   * long-lived tokens and doesn't always send `expires_in` (its refresh-grant
+   * spec doesn't document the field at all). Absent means "no known expiry",
+   * which is the pre-2026 behaviour — see isTokenExpired() in oauth/token.ts.
+   */
+  expiresAt?: number;
   /** Returned by Notion on OAuth exchange. Unique per bot-per-workspace. */
   botId: string;
   /** Notion workspace identifier. */

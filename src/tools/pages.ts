@@ -4,8 +4,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../accounts/resolver";
-import { NotionClient, stripDashes, type NotionPageObject } from "../notion/client";
+import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../accounts/resolver";
+import { stripDashes, type NotionPageObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 import { markdownToBlocks, type BlockRequest } from "../notion/markdown/to-blocks";
 import { updatePageHandler, UPDATE_PAGE_INPUT_SCHEMA } from "./update-page";
@@ -86,7 +86,7 @@ export function registerPageTools(register: (def: ToolDef) => void): void {
 
 async function createPagesHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const parentRaw = args.parent;
   const parent = normalizeParent(parentRaw);

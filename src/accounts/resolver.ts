@@ -8,6 +8,22 @@
 
 import type { NotionAccount, ToolContext } from "../mcp/types";
 import { AccountStore } from "./store";
+import { NotionClient } from "../notion/client";
+import { recoverFromUnauthorized, refreshAccountToken } from "./refresh";
+import { isTokenExpired } from "../oauth/token";
+
+/**
+ * Build the API client for a resolved account, wired for token refresh.
+ *
+ * Every tool goes through here rather than `new NotionClient(account)` so the
+ * reactive refresh-on-unauthorized path is universal — there is no call site
+ * that silently opts out of it.
+ */
+export function createNotionClient(account: NotionAccount, ctx: ToolContext): NotionClient {
+  return new NotionClient(account, {
+    onUnauthorized: () => recoverFromUnauthorized(ctx.env, account),
+  });
+}
 
 export async function resolveAccount(
   args: Record<string, unknown>,
@@ -32,6 +48,18 @@ export async function resolveAccount(
         ? ` Available accounts: ${list.map((a) => `"${a.name}"`).join(", ")}.`
         : " No accounts are connected — use notion_account_add to connect one first.";
     throw new Error(`No Notion account matching "${raw}".${hint}`);
+  }
+
+  // Proactive refresh: if the stored token has a known expiry that has already
+  // passed and a refresh token is available, exchange before the caller uses
+  // it. Accounts written by the pre-2026 code carry no `expiresAt`, so
+  // isTokenExpired() returns false for them and this is a no-op — they keep
+  // behaving exactly as they always have, with no re-authorization required.
+  // A failed refresh returns null and we hand back the original account: the
+  // request then produces today's error rather than a new refresh-specific one.
+  if (isTokenExpired(acct, Date.now())) {
+    const refreshed = await refreshAccountToken(ctx.env, acct);
+    if (refreshed) return refreshed;
   }
   return acct;
 }

@@ -14,8 +14,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient, dataSourceDisplayName, stripDashes } from "../notion/client";
+import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
+import { dataSourceDisplayName, stripDashes } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 
 export function registerFetchTool(register: (def: ToolDef) => void): void {
@@ -50,7 +50,7 @@ async function fetchHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
   if (!rawId) return { isError: true, content: [{ type: "text", text: "`id` is required." }] };
 
   const target = parseNotionIdentifier(rawId);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   if (target.kind === "data_source") {
     const ds = await client.getDataSource(target.id);

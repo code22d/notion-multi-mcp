@@ -15,25 +15,18 @@
 
 import type { Env, NotionAccount } from "../mcp/types";
 import { AccountStore } from "../accounts/store";
+import {
+  exchangeAuthorizationCode,
+  tokenFieldsFromResponse,
+  type NotionTokenResponse,
+} from "./token";
 
 const NOTION_AUTHORIZE_URL = "https://api.notion.com/v1/oauth/authorize";
-const NOTION_TOKEN_URL = "https://api.notion.com/v1/oauth/token";
 const STATE_TTL_SECONDS = 60 * 10; // 10 minutes
 
 interface StateRecord {
   proposedName: string;
   createdAt: number;
-}
-
-interface NotionTokenResponse {
-  access_token: string;
-  token_type: string;
-  bot_id: string;
-  workspace_name: string | null;
-  workspace_icon: string | null;
-  workspace_id: string;
-  owner: unknown;
-  duplicated_template_id: string | null;
 }
 
 // -----------------------------------------------------------------------------
@@ -126,10 +119,18 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
 
   const store = new AccountStore(env.NOTION_MCP_KV);
   const id = cryptoRandomString(24);
+  // Persist the WHOLE token pair, not just the access token. Since 2026-06-08
+  // Notion mints a fresh access_token AND refresh_token on every successful
+  // authorization, with explicit guidance to store the pair from every
+  // response. Both fields are spread conditionally, so a connection that
+  // returns neither writes exactly the record shape the old code wrote.
+  const tokenFields = tokenFieldsFromResponse(tokenData, Date.now());
   const account: NotionAccount = {
     id,
     name: stateRec.proposedName,
-    accessToken: tokenData.access_token,
+    accessToken: tokenFields.accessToken,
+    ...(tokenFields.refreshToken !== undefined ? { refreshToken: tokenFields.refreshToken } : {}),
+    ...(tokenFields.expiresAt !== undefined ? { expiresAt: tokenFields.expiresAt } : {}),
     botId: tokenData.bot_id,
     workspaceId: tokenData.workspace_id,
     workspaceName: tokenData.workspace_name ?? "(unnamed workspace)",
@@ -152,26 +153,11 @@ export async function handleOauthCallback(request: Request, env: Env): Promise<R
 // Helpers
 // -----------------------------------------------------------------------------
 
-async function exchangeCode(env: Env, code: string, redirectUri: string): Promise<NotionTokenResponse> {
-  const creds = btoa(`${env.NOTION_OAUTH_CLIENT_ID}:${env.NOTION_OAUTH_CLIENT_SECRET}`);
-  const res = await fetch(NOTION_TOKEN_URL, {
-    method: "POST",
-    headers: {
-      authorization: `Basic ${creds}`,
-      "content-type": "application/json",
-      "notion-version": "2022-06-28",
-    },
-    body: JSON.stringify({
-      grant_type: "authorization_code",
-      code,
-      redirect_uri: redirectUri,
-    }),
-  });
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Notion token endpoint returned ${res.status}: ${text}`);
-  }
-  return (await res.json()) as NotionTokenResponse;
+function exchangeCode(env: Env, code: string, redirectUri: string): Promise<NotionTokenResponse> {
+  // Delegates to oauth/token.ts so the code-exchange and refresh grants share
+  // one implementation of the endpoint, the Basic-auth header, the pinned
+  // notion-version, and the token-redacting error path.
+  return exchangeAuthorizationCode(env, code, redirectUri);
 }
 
 function cryptoRandomString(bytes: number): string {

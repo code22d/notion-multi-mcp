@@ -9,8 +9,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolResult } from "../../mcp/types";
-import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../../accounts/resolver";
-import { NotionClient, stripDashes } from "../../notion/client";
+import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../../accounts/resolver";
+import { stripDashes } from "../../notion/client";
 import { updatePropertiesHandler } from "./properties";
 import { updateVerificationHandler } from "./verification";
 import { applyTemplateHandler } from "./template";
@@ -96,7 +96,7 @@ export const UPDATE_PAGE_INPUT_SCHEMA = {
 
 export async function updatePageHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const pageIdRaw = args.page_id;
   if (typeof pageIdRaw !== "string" || !pageIdRaw) {

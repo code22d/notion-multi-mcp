@@ -14,8 +14,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../accounts/resolver";
-import { NotionClient, stripDashes, type NotionViewObject } from "../notion/client";
+import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../accounts/resolver";
+import { stripDashes, type NotionViewObject } from "../notion/client";
 import { parseViewDsl, ParseError } from "../notion/view-dsl/parser";
 import { emitViewBody, EmitError, type EmittedViewBody, type ViewType } from "../notion/view-dsl/emit";
 import type { DirectiveAst } from "../notion/view-dsl/ast";
@@ -72,7 +72,7 @@ export function registerViewTools(register: (def: ToolDef) => void): void {
 
 async function createViewHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const databaseId = typeof args.database_id === "string" ? args.database_id.trim() : "";
   const dataSourceId = typeof args.data_source_id === "string" ? args.data_source_id.trim() : "";
@@ -135,7 +135,7 @@ async function createViewHandler(args: Record<string, unknown>, ctx: ToolContext
 
 async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const viewId = typeof args.view_id === "string" ? args.view_id.trim() : "";
   if (!viewId) return textErr("`view_id` is required.");

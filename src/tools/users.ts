@@ -8,8 +8,7 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient } from "../notion/client";
+import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
 
 export function registerUserTools(register: (def: ToolDef) => void): void {
   register({
@@ -56,7 +55,7 @@ export function registerUserTools(register: (def: ToolDef) => void): void {
 
 async function getUsersHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   // Single-user lookup
   if (typeof args.user_id === "string" && args.user_id.trim()) {

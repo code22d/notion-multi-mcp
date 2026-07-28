@@ -13,7 +13,7 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
+import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
 import { NotionClient, type NotionRichText } from "../notion/client";
 import { plainToRichText, richTextToMarkdown } from "../notion/markdown/rich-text";
 
@@ -87,7 +87,7 @@ async function createCommentHandler(args: Record<string, unknown>, ctx: ToolCont
   }
 
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const rich: NotionRichText[] = Array.isArray(args.rich_text)
     ? (args.rich_text as NotionRichText[])
@@ -212,7 +212,7 @@ export function formatCreateCommentResult(
 
 async function getCommentsHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const targetId = String(args.page_id ?? args.block_id ?? "").trim();
   if (!targetId) {

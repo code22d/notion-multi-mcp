@@ -19,7 +19,7 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
+import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
 import {
   NotionClient,
   type NotionBlockObject,
@@ -86,7 +86,7 @@ export function registerDuplicateAndMoveTools(register: (def: ToolDef) => void):
 
 async function duplicatePageHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const pageId = typeof args.page_id === "string" ? args.page_id.trim() : "";
   if (!pageId) return textErr("`page_id` is required.");
@@ -511,7 +511,7 @@ function richTextArrayToPlain(runs: NotionRichText[]): string {
 
 async function moveHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const ids = Array.isArray(args.page_or_database_ids) ? (args.page_or_database_ids as string[]) : [];
   const parent = coerceToObject(args.new_parent);

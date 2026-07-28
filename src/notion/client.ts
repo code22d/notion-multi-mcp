@@ -52,17 +52,26 @@ export interface NotionClientOptions {
   sleepImpl?: (ms: number) => Promise<void>;
   /** Injectable clock, used only to resolve HTTP-date `Retry-After` values. */
   nowImpl?: () => number;
+  /**
+   * Called at most once per request when Notion answers `unauthorized`.
+   * Returns a fresh access token to retry with, or null to let the original
+   * error stand. Wired by createNotionClient() in accounts/resolver.ts; absent
+   * in tests and in any call site that doesn't have an Env to refresh against.
+   */
+  onUnauthorized?: () => Promise<string | null>;
 }
 
 export class NotionClient {
   private readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<void>;
   private readonly nowImpl: () => number;
+  private readonly onUnauthorized: (() => Promise<string | null>) | undefined;
 
   constructor(private readonly account: NotionAccount, opts: NotionClientOptions = {}) {
     this.fetchImpl = opts.fetchImpl ?? ((input, init) => fetch(input as RequestInfo, init));
     this.sleepImpl = opts.sleepImpl ?? sleep;
     this.nowImpl = opts.nowImpl ?? (() => Date.now());
+    this.onUnauthorized = opts.onUnauthorized;
   }
 
   // -------------------------------------------------------------------
@@ -98,6 +107,9 @@ export class NotionClient {
     let lastError: Error | null = null;
     let totalSlept = 0;
     let attempt = 0;
+    // Token refresh is attempted at most once per request. Without this latch
+    // a permanently-rejected token would loop: refresh, 401, refresh, 401.
+    let refreshAttempted = false;
     // Bound the loop by the larger of the two budgets; the per-class check
     // inside decides when to actually give up.
     const maxAttempts = Math.max(MAX_ATTEMPTS_429, MAX_ATTEMPTS_5XX);
@@ -115,6 +127,25 @@ export class NotionClient {
         /* not json */
       }
       const msg = parsed?.message ?? text;
+
+      // Dead access token: if the account carries a refresh token, exchange it
+      // and retry this request once with the new credential. This does NOT
+      // count against the retry-attempt budget — it's a different failure mode
+      // from rate limiting, and a refresh that works should not eat an attempt
+      // that a subsequent 429 might need.
+      if (
+        (res.status === 401 || parsed?.code === "unauthorized") &&
+        !refreshAttempted &&
+        this.onUnauthorized
+      ) {
+        refreshAttempted = true;
+        const fresh = await this.onUnauthorized();
+        if (fresh) {
+          headers.authorization = `Bearer ${fresh}`;
+          continue;
+        }
+        // Refresh not possible or rejected — fall through to today's error.
+      }
 
       const isRateLimited = res.status === 429;
       const retriable = isRateLimited || res.status >= 500;

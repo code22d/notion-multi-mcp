@@ -4,8 +4,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient, dataSourceDisplayName, type NotionPageObject, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
+import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
+import { dataSourceDisplayName, type NotionPageObject, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 
 export function registerSearchTool(register: (def: ToolDef) => void): void {
@@ -46,7 +46,7 @@ export function registerSearchTool(register: (def: ToolDef) => void): void {
 
 async function searchHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const query = typeof args.query === "string" ? args.query : "";
   const pageSize = typeof args.page_size === "number" ? args.page_size : 25;

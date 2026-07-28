@@ -18,8 +18,8 @@
 // -----------------------------------------------------------------------------
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
-import { ACCOUNT_PARAM_SCHEMA, resolveAccount } from "../accounts/resolver";
-import { NotionClient, stripDashes, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
+import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../accounts/resolver";
+import { stripDashes, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
 import { parseCreateTable, parseAlterStatements, ParseError } from "../notion/ddl/parser";
 import { emitCreateProperties, emitAlterPatch, plainTextToRichText, EmitError } from "../notion/ddl/emit";
 
@@ -91,7 +91,7 @@ export function registerDatabaseTools(register: (def: ToolDef) => void): void {
 
 async function createDatabaseHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const parent = normalizeCreateParent(args.parent);
   if (!parent) {
@@ -155,7 +155,7 @@ async function createDatabaseHandler(args: Record<string, unknown>, ctx: ToolCon
 
 async function updateDataSourceHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
   const account = await resolveAccount(args, ctx);
-  const client = new NotionClient(account);
+  const client = createNotionClient(account, ctx);
 
   const dsIdRaw = args.data_source_id;
   if (typeof dsIdRaw !== "string" || !dsIdRaw.trim()) {
