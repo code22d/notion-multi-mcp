@@ -65,6 +65,30 @@ export function normalizeId(id: string): string {
 }
 
 /**
+ * Strip response-only null fields from a block's type-body object in place.
+ *
+ * Notion's GET responses include fields like `icon: null`, `color: null`,
+ * `caption: null` on most block bodies, but the POST/PATCH schema rejects
+ * `null` for those fields — they must be an object or absent. Calling this on
+ * a type body (e.g. `block.paragraph`, `block.callout`) removes any top-level
+ * key whose value is `null`, with one exception: `synced_from: null` is a
+ * meaningful signal for a synced_block ORIGINAL (vs a reference), so we keep
+ * it when `type === "synced_block"`.
+ *
+ * Shared between apply_template's `cloneBlockForRequest` and
+ * duplicate_page's `sanitizeTypeBody` so the two paths can't drift when Notion
+ * adds new response-only nullable fields.
+ */
+export function stripResponseOnlyNulls(body: Record<string, unknown>, type: string): void {
+  for (const key of Object.keys(body)) {
+    if (body[key] === null) {
+      if (type === "synced_block" && key === "synced_from") continue;
+      delete body[key];
+    }
+  }
+}
+
+/**
  * Convert a hydrated response-shape block into a request-shape BlockRequest,
  * stripping fields the create/append endpoints reject (id, timestamps, parent,
  * etc.). Children are cloned recursively.
@@ -88,6 +112,10 @@ export function cloneBlockForRequest(block: HydratedBlock): BlockRequest | null 
   // Strip runtime-only fields from nested block objects (table_row's `cells`
   // stays; everything else we keep). Deep-clone via JSON to avoid aliasing.
   const clonedPayload = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
+  // Notion's GET response includes fields like `icon: null` / `color: null` on
+  // most block bodies, but its POST/PATCH schema rejects `null` for those —
+  // strip response-only nulls before we send the request.
+  stripResponseOnlyNulls(clonedPayload, type);
   // `children` inside the payload (e.g. column_list.column_list.children) —
   // we'll rebuild from the hydrated block.children, but certain types carry
   // an inline children array (table → rows). Leave those alone.

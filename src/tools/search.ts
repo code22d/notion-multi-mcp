@@ -5,7 +5,7 @@
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient, type NotionPageObject, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
+import { NotionClient, dataSourceDisplayName, type NotionPageObject, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 
 export function registerSearchTool(register: (def: ToolDef) => void): void {
@@ -86,14 +86,15 @@ function formatSearchResult(item: NotionPageObject | NotionDatabaseObject | Noti
     return `- [page] **${title || "(untitled)"}** — ${item.url}\n  id: ${item.id} · last edited: ${item.last_edited_time}`;
   }
   if (item.object === "data_source") {
-    // 2025-09-03 API: search results for filter "data_source" return data source objects
-    // with `name` (not `title`). URL + last_edited_time may or may not be present.
+    // 2025-09-03 API: data_source objects carry their display name under
+    // `title` (as a rich_text array). Older shapes used `name`. The helper
+    // handles both; see dataSourceDisplayName() in notion/client.ts.
     const ds = item as NotionDataSourceObject & { url?: string; last_edited_time?: string };
     const parent = ds.database_parent?.database_id
       ? ` · database: ${ds.database_parent.database_id}`
       : "";
     const url = ds.url ? ` — ${ds.url}` : "";
-    return `- [data_source] **${ds.name || "(untitled)"}**${url}\n  id: ${ds.id} · collection://${ds.id}${parent}`;
+    return `- [data_source] **${dataSourceDisplayName(ds)}**${url}\n  id: ${ds.id} · collection://${ds.id}${parent}`;
   }
   // Legacy database object (unfiltered search may still return these from older API behavior)
   const db = item as NotionDatabaseObject;

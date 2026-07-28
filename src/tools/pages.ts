@@ -9,6 +9,13 @@ import { NotionClient, stripDashes, type NotionPageObject } from "../notion/clie
 import { richTextToPlain } from "../notion/markdown/rich-text";
 import { markdownToBlocks, type BlockRequest } from "../notion/markdown/to-blocks";
 import { updatePageHandler, UPDATE_PAGE_INPUT_SCHEMA } from "./update-page";
+import {
+  coerceScalarToPropertyValue,
+  needsTypeResolution,
+  resolveTypesForParent,
+  UNKNOWN_TYPES,
+  type PropertyTypeResolver,
+} from "../notion/property-values";
 
 const CHILDREN_PER_REQUEST = 100;
 
@@ -99,6 +106,19 @@ async function createPagesHandler(args: Record<string, unknown>, ctx: ToolContex
   const created: Array<{ id: string; url: string; title: string }> = [];
   const errors: string[] = [];
 
+  // Every page in a single call shares one parent, so resolve the column types
+  // once for the whole batch. Skipped entirely when no page passes an ambiguous
+  // bare string, and when the parent is a page/workspace (no schema).
+  const anyAmbiguous = pagesRaw.some((p) => {
+    if (!p || typeof p !== "object") return false;
+    const props = (p as Record<string, unknown>).properties;
+    if (!props || typeof props !== "object" || Array.isArray(props)) return false;
+    return needsTypeResolution(props as Record<string, unknown>);
+  });
+  const resolveType: PropertyTypeResolver = anyAmbiguous
+    ? await resolveTypesForParent(client, parent)
+    : UNKNOWN_TYPES;
+
   for (let i = 0; i < pagesRaw.length; i++) {
     const spec = pagesRaw[i] as Record<string, unknown> | undefined;
     if (!spec || typeof spec !== "object") {
@@ -106,7 +126,7 @@ async function createPagesHandler(args: Record<string, unknown>, ctx: ToolContex
       continue;
     }
     try {
-      const body = buildCreatePageBody(parent, spec);
+      const body = buildCreatePageBody(parent, spec, resolveType);
       const firstBatch = body.children.slice(0, CHILDREN_PER_REQUEST);
       const overflow = body.children.slice(CHILDREN_PER_REQUEST);
 
@@ -203,10 +223,14 @@ interface BuiltPageBody {
   children: BlockRequest[];
 }
 
-function buildCreatePageBody(parent: NormalizedParent, spec: Record<string, unknown>): BuiltPageBody {
+function buildCreatePageBody(
+  parent: NormalizedParent,
+  spec: Record<string, unknown>,
+  resolveType: PropertyTypeResolver = UNKNOWN_TYPES
+): BuiltPageBody {
   const content = typeof spec.content === "string" ? spec.content : "";
   const children = markdownToBlocks(content);
-  const properties = normalizeProperties(spec.properties, parent);
+  const properties = normalizeProperties(spec.properties, parent, resolveType);
   const out: BuiltPageBody = { parent, properties, children };
   const icon = normalizeIcon(spec.icon);
   if (icon) out.icon = icon;
@@ -215,7 +239,11 @@ function buildCreatePageBody(parent: NormalizedParent, spec: Record<string, unkn
   return out;
 }
 
-function normalizeProperties(raw: unknown, parent: NormalizedParent): Record<string, unknown> {
+function normalizeProperties(
+  raw: unknown,
+  parent: NormalizedParent,
+  resolveType: PropertyTypeResolver = UNKNOWN_TYPES
+): Record<string, unknown> {
   if (!raw || typeof raw !== "object") {
     // Page-under-page requires at least a title; default to empty so Notion can
     // untitled-fallback. Database parents must carry their own columns.
@@ -223,7 +251,7 @@ function normalizeProperties(raw: unknown, parent: NormalizedParent): Record<str
   }
   const out: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
-    out[key] = coercePropertyValue(key, value);
+    out[key] = coercePropertyValue(key, value, resolveType);
   }
   // Page-under-page needs a `title` property — auto-add if missing.
   if (parent.type === "page_id" && !("title" in out)) {
@@ -232,20 +260,20 @@ function normalizeProperties(raw: unknown, parent: NormalizedParent): Record<str
   return out;
 }
 
-function coercePropertyValue(key: string, value: unknown): unknown {
-  // Shorthand: string → title rich_text (when key is "title").
-  if (typeof value === "string") {
-    if (key.toLowerCase() === "title" || key === "Title" || key === "Name") {
-      return { title: [{ type: "text", text: { content: value } }] };
-    }
-    return { rich_text: [{ type: "text", text: { content: value } }] };
-  }
+function coercePropertyValue(
+  key: string,
+  value: unknown,
+  resolveType: PropertyTypeResolver = UNKNOWN_TYPES
+): unknown {
   // Shorthand: array of strings → multi_select (only when value is a pure string array).
   if (Array.isArray(value) && value.every((v) => typeof v === "string")) {
     return { multi_select: (value as string[]).map((name) => ({ name })) };
   }
-  if (typeof value === "boolean") return { checkbox: value };
-  if (typeof value === "number") return { number: value };
+  // Scalars — serialize against the column's real type when the schema told us
+  // one, otherwise the historical name/value heuristic. See property-values.ts.
+  if (typeof value === "string" || typeof value === "boolean" || typeof value === "number") {
+    return coerceScalarToPropertyValue(key, value, resolveType(key));
+  }
   // Otherwise assume the caller passed a native Notion property value object.
   return value;
 }

@@ -14,7 +14,7 @@
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient } from "../notion/client";
+import { NotionClient, type NotionRichText } from "../notion/client";
 import { plainToRichText, richTextToMarkdown } from "../notion/markdown/rich-text";
 
 export function registerCommentTools(register: (def: ToolDef) => void): void {
@@ -89,19 +89,22 @@ async function createCommentHandler(args: Record<string, unknown>, ctx: ToolCont
   const account = await resolveAccount(args, ctx);
   const client = new NotionClient(account);
 
-  const rich = Array.isArray(args.rich_text)
-    ? (args.rich_text as import("../notion/client").NotionRichText[])
+  const rich: NotionRichText[] = Array.isArray(args.rich_text)
+    ? (args.rich_text as NotionRichText[])
     : plainToRichText(String(args.text ?? ""));
 
   if (rich.length === 0) {
     return { isError: true, content: [{ type: "text", text: "Provide either `text` or a non-empty `rich_text` array." }] };
   }
 
+  const discussionId = typeof args.discussion_id === "string" ? args.discussion_id.trim() : "";
+  const pageId = typeof args.page_id === "string" ? args.page_id.trim() : "";
+
   let body: Record<string, unknown>;
-  if (typeof args.discussion_id === "string" && args.discussion_id.trim()) {
-    body = { discussion_id: args.discussion_id.trim(), rich_text: rich };
-  } else if (typeof args.page_id === "string" && args.page_id.trim()) {
-    body = { parent: { page_id: args.page_id.trim() }, rich_text: rich };
+  if (discussionId) {
+    body = { discussion_id: discussionId, rich_text: rich };
+  } else if (pageId) {
+    body = { parent: { page_id: pageId }, rich_text: rich };
   } else {
     return {
       isError: true,
@@ -110,19 +113,101 @@ async function createCommentHandler(args: Record<string, unknown>, ctx: ToolCont
   }
 
   const created = await client.createComment(body);
-  return {
-    content: [
-      {
-        type: "text",
-        text: [
-          `✅ Created comment ${created.id}`,
-          `Discussion: ${created.discussion_id}`,
-          `Author: ${created.created_by.id}`,
-          `Text: ${richTextToMarkdown(created.rich_text)}`,
-        ].join("\n"),
-      },
-    ],
+  // Notion's POST /v1/comments can return a PartialCommentObjectResponse —
+  // `{ object: "comment", id }` only — omitting discussion_id, created_by and
+  // rich_text. Pass fallback context so the formatter shows real values when
+  // the API returns the partial shape. See formatCreateCommentResult.
+  const text = formatCreateCommentResult(created, {
+    discussion_id: discussionId || undefined,
+    page_id: pageId || undefined,
+    richText: rich,
+    authorId: account.botId,
+  });
+  return { content: [{ type: "text", text }] };
+}
+
+/**
+ * Context from the create request that the formatter uses to backfill any
+ * fields absent from Notion's response. Every field is optional — the
+ * formatter gracefully degrades to "(unknown)" / "(no text returned)" if the
+ * fallback itself is missing something.
+ */
+export interface CreateCommentFallback {
+  /** discussion_id we sent in the request (for replies). */
+  discussion_id?: string;
+  /** page_id we sent in the request (for new page-level comments). */
+  page_id?: string;
+  /** rich_text we sent in the request — used as comment text fallback. */
+  richText?: NotionRichText[];
+  /** Bot id of the integration that created the comment. */
+  authorId?: string;
+}
+
+/**
+ * Format the response from POST /v1/comments as a user-visible block of text.
+ *
+ * Exported for unit tests. Notion's API typings declare the response as
+ * `PartialCommentObjectResponse | CommentObjectResponse` — in practice the
+ * partial shape (`{ object, id }` only, missing discussion_id / created_by /
+ * rich_text) appears often enough that a previous iteration of this formatter
+ * fell through to placeholders on every real request. We now accept an
+ * optional `fallback` populated from the request context (handler passes what
+ * it sent + the integration's bot id) and prefer those values when the
+ * response omits them. If neither the response nor the fallback has a field,
+ * we still emit an `(unknown)` / `(no text returned)` placeholder rather than
+ * crashing.
+ */
+export function formatCreateCommentResult(
+  created: unknown,
+  fallback: CreateCommentFallback = {}
+): string {
+  // Defensive read — accept any shape, validate each field independently.
+  const obj = (created && typeof created === "object" ? (created as Record<string, unknown>) : {}) as {
+    id?: unknown;
+    discussion_id?: unknown;
+    created_by?: { id?: unknown } | null;
+    rich_text?: unknown;
   };
+
+  const id = typeof obj.id === "string" && obj.id ? obj.id : "(unknown)";
+
+  let discussion: string;
+  if (typeof obj.discussion_id === "string" && obj.discussion_id) {
+    discussion = obj.discussion_id;
+  } else if (fallback.discussion_id) {
+    discussion = fallback.discussion_id;
+  } else if (fallback.page_id) {
+    // Page-level create — we don't know the new discussion id, but we can tell
+    // the user which page it was anchored to so the output isn't opaque.
+    discussion = `(new discussion on page ${fallback.page_id})`;
+  } else {
+    discussion = "(unknown)";
+  }
+
+  let author: string;
+  if (obj.created_by && typeof obj.created_by === "object" && typeof obj.created_by.id === "string") {
+    author = obj.created_by.id;
+  } else if (fallback.authorId) {
+    author = fallback.authorId;
+  } else {
+    author = "(unknown)";
+  }
+
+  let text: string;
+  if (Array.isArray(obj.rich_text) && obj.rich_text.length > 0) {
+    text = richTextToMarkdown(obj.rich_text as NotionRichText[]);
+  } else if (fallback.richText && fallback.richText.length > 0) {
+    text = richTextToMarkdown(fallback.richText);
+  } else {
+    text = "(no text returned)";
+  }
+
+  return [
+    `✅ Created comment ${id}`,
+    `Discussion: ${discussion}`,
+    `Author: ${author}`,
+    `Text: ${text}`,
+  ].join("\n");
 }
 
 async function getCommentsHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
@@ -134,17 +219,73 @@ async function getCommentsHandler(args: Record<string, unknown>, ctx: ToolContex
     return { isError: true, content: [{ type: "text", text: "Provide `page_id` or `block_id`." }] };
   }
 
+  const discussionFilter = typeof args.discussion_id === "string" && args.discussion_id ? args.discussion_id : undefined;
+  return getCommentsForClient(client, { targetId, discussionFilter });
+}
+
+/**
+ * Subset of NotionClient that the comments fetch logic actually needs. Keeps
+ * the unit test decoupled from request/fetch plumbing — a plain mock object
+ * implementing these two methods is enough.
+ */
+export interface GetCommentsClient {
+  listComments: NotionClient["listComments"];
+  getPage: NotionClient["getPage"];
+}
+
+/**
+ * Core logic for notion_get_comments, isolated from ToolContext / account
+ * resolution so it can be unit tested against a mock client.
+ *
+ * The 404 branch is the reason this exists as a separate function: Notion
+ * returns `404 — Could not find block with ID … make sure the relevant pages
+ * and databases are shared with your integration` from GET /v1/comments when
+ * the page IS shared but the integration lacks the "Read comments" capability.
+ * The message is misleading — the user has already shared the page and will
+ * chase the wrong fix. We probe GET /pages/{id}: if that succeeds the share is
+ * fine and the real remedy is enabling the capability at
+ * notion.so/profile/integrations. If it also 404s, the page genuinely isn't
+ * shared with the integration and the original error stands.
+ */
+export async function getCommentsForClient(
+  client: GetCommentsClient,
+  opts: { targetId: string; discussionFilter?: string }
+): Promise<ToolResult> {
+  const { targetId, discussionFilter } = opts;
+
   const all: import("../notion/client").NotionCommentObject[] = [];
   let cursor: string | undefined;
-  do {
-    const page = await client.listComments(targetId, cursor ? { startCursor: cursor } : {});
-    all.push(...page.results);
-    cursor = page.has_more ? (page.next_cursor ?? undefined) : undefined;
-  } while (cursor);
+  try {
+    do {
+      const page = await client.listComments(targetId, cursor ? { startCursor: cursor } : {});
+      all.push(...page.results);
+      cursor = page.has_more ? (page.next_cursor ?? undefined) : undefined;
+    } while (cursor);
+  } catch (err) {
+    if (isNotion404(err)) {
+      const pageReachable = await probePageAccessible(client, targetId);
+      if (pageReachable) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text:
+                `The page ${targetId} is shared with the integration, but the comments endpoint returned 404. ` +
+                `This means the integration lacks the "Read comments" capability. ` +
+                `Enable it at https://www.notion.so/profile/integrations — open the integration, go to Capabilities, ` +
+                `and tick "Read comments" (and "Insert comments" if you also want notion_create_comment to work).`,
+            },
+          ],
+        };
+      }
+    }
+    throw err;
+  }
 
   let filtered = all;
-  if (typeof args.discussion_id === "string" && args.discussion_id) {
-    filtered = all.filter((c) => c.discussion_id === args.discussion_id);
+  if (discussionFilter) {
+    filtered = all.filter((c) => c.discussion_id === discussionFilter);
   }
 
   // Group by discussion
@@ -164,4 +305,19 @@ async function getCommentsHandler(args: Record<string, unknown>, ctx: ToolContex
     lines.push("");
   }
   return { content: [{ type: "text", text: lines.join("\n") }] };
+}
+
+function isNotion404(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  // client.request() throws `Notion API ${status}: ${message}`.
+  return /^Notion API 404\b/.test(err.message);
+}
+
+async function probePageAccessible(client: GetCommentsClient, id: string): Promise<boolean> {
+  try {
+    await client.getPage(id);
+    return true;
+  } catch {
+    return false;
+  }
 }

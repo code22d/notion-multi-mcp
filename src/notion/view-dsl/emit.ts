@@ -67,6 +67,14 @@ export interface EmitContext {
    *  APIs require IDs. Handlers fetch the data source and pass a resolver here.
    *  If omitted (e.g. in unit tests), property names pass through unchanged. */
   resolvePropertyId?: (name: string) => string;
+  /** Optional: resolve a property NAME to its Notion column type (e.g.
+   *  "select", "status", "number", "checkbox"). Used by FILTER emission to
+   *  pick the right filter-condition shape (select columns need
+   *  `{select: {equals: …}}`, not `{rich_text: {equals: …}}`). Returns
+   *  undefined when the name isn't found — the emitter falls back to
+   *  operator/value inference in that case, preserving the old behaviour for
+   *  handlers that don't pass a resolver. */
+  resolvePropertyType?: (name: string) => string | undefined;
 }
 
 /** Emitted body — a subset of CreateViewRequest / UpdateViewRequest fields. */
@@ -146,7 +154,7 @@ export function emitViewBody(directives: DirectiveAst[], ctx: EmitContext): Emit
 
   const out: EmittedViewBody = {};
 
-  if (filterAst) out.filter = emitFilter(filterAst);
+  if (filterAst) out.filter = emitFilter(filterAst, ctx);
   if (sorts.length > 0) out.sorts = sorts.map(emitSort);
 
   // Configuration is built only if any config-relevant directive is present.
@@ -196,14 +204,14 @@ function resolvePropId(ctx: EmitContext, name: string): string {
 // Filter emission
 // -----------------------------------------------------------------------------
 
-function emitFilter(f: FilterAst): EmittedFilter {
-  if (f.kind === "compound") return emitCompoundFilter(f);
+function emitFilter(f: FilterAst, ctx: EmitContext): EmittedFilter {
+  if (f.kind === "compound") return emitCompoundFilter(f, ctx);
   if (f.kind === "timestamp") return emitTimestampFilter(f);
-  return emitPropertyFilter(f);
+  return emitPropertyFilter(f, ctx);
 }
 
-function emitCompoundFilter(f: CompoundFilterAst): EmittedFilter {
-  return { [f.op]: f.filters.map(emitFilter) };
+function emitCompoundFilter(f: CompoundFilterAst, ctx: EmitContext): EmittedFilter {
+  return { [f.op]: f.filters.map((sub) => emitFilter(sub, ctx)) };
 }
 
 function emitTimestampFilter(f: TimestampFilterAst): EmittedFilter {
@@ -214,13 +222,74 @@ function emitTimestampFilter(f: TimestampFilterAst): EmittedFilter {
   };
 }
 
-function emitPropertyFilter(f: PropertyFilterAst): EmittedFilter {
-  const type = f.propertyType ?? inferFilterType(f.operator, f.value);
+function emitPropertyFilter(f: PropertyFilterAst, ctx: EmitContext): EmittedFilter {
+  // Type-pick precedence:
+  //   1. Explicit override in the DSL (e.g. `"Prop" SELECT = "Done"`)
+  //   2. Data-source schema lookup via ctx.resolvePropertyType — this is how
+  //      FILTER on a SELECT / STATUS / NUMBER / CHECKBOX / DATE column ends up
+  //      with the right filter shape. Missing resolver → skip.
+  //   3. Operator+value inference (the legacy fallback — only safe for text
+  //      properties + a few operator-driven types like number/checkbox).
+  const resolvedType = f.propertyType
+    ? undefined
+    : mapNotionPropertyType(ctx.resolvePropertyType?.(f.property), f.property);
+  const type = f.propertyType ?? resolvedType ?? inferFilterType(f.operator, f.value);
   const condition = emitFilterCondition(type, f.operator, f.value);
   return {
     property: f.property,
     [type]: condition,
   };
+}
+
+/**
+ * Map a Notion column type (as it appears on a data source's `properties` map)
+ * to the filter-property-type key that belongs on the emitted filter. Returns
+ * `undefined` for types we don't know about — callers fall back to inference.
+ * Throws a clean `EmitError` for types that Notion's filter API does support
+ * but we haven't wired up yet (formula, rollup, created_time, etc.) so the
+ * caller gets a specific message instead of a Notion 400.
+ */
+function mapNotionPropertyType(
+  raw: string | undefined,
+  property: string
+): FilterPropertyType | undefined {
+  if (!raw) return undefined;
+  switch (raw) {
+    case "title":
+    case "rich_text":
+    case "number":
+    case "select":
+    case "multi_select":
+    case "status":
+    case "date":
+    case "people":
+    case "files":
+    case "checkbox":
+    case "url":
+    case "email":
+    case "phone_number":
+    case "relation":
+      return raw;
+    case "formula":
+      throw new EmitError(
+        `FILTER on FORMULA columns is not yet supported — filter on the underlying property instead. (property "${property}")`
+      );
+    case "rollup":
+    case "created_time":
+    case "last_edited_time":
+    case "created_by":
+    case "last_edited_by":
+    case "unique_id":
+    case "verification":
+    case "button":
+      throw new EmitError(
+        `FILTER on ${raw} columns is not yet supported (property "${property}"). ` +
+          `Pass an explicit type override in the DSL if you know the shape Notion expects.`
+      );
+    default:
+      // Unknown / future property type — let inference take over.
+      return undefined;
+  }
 }
 
 /**

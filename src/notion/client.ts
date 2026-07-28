@@ -270,6 +270,8 @@ export interface NotionPageObject {
   public_url?: string | null;
   icon?: NotionIcon | null;
   cover?: NotionCover | null;
+  /** Only present on wiki-home pages. Absent / false on regular pages. */
+  is_wiki_page?: boolean;
 }
 
 export interface NotionDatabaseObject {
@@ -285,15 +287,42 @@ export interface NotionDatabaseObject {
   is_inline?: boolean;
   icon?: NotionIcon | null;
   cover?: NotionCover | null;
-  data_sources?: Array<{ id: string; name: string }>;
+  // Each data-source summary under a database may carry either the legacy
+  // `name` string or a 2025-09-03 `title` rich_text array. The
+  // dataSourceDisplayName() helper in this file handles both.
+  data_sources?: Array<{ id: string; name?: string; title?: NotionRichText[] }>;
 }
 
 export interface NotionDataSourceObject {
   object: "data_source";
   id: string;
   database_parent?: { database_id: string };
-  name: string;
+  /**
+   * Legacy "name" field. API 2025-09-03 responses carry the display name under
+   * `title` (as a rich_text array) instead. Both are optional here — use the
+   * `dataSourceDisplayName()` helper in client-callers to pick the right one.
+   */
+  name?: string;
+  /** API 2025-09-03 — display name as a rich_text array. */
+  title?: NotionRichText[];
   properties: Record<string, unknown>;
+}
+
+/**
+ * Extract the display name of a data source. Prefers the 2025-09-03 `title`
+ * rich_text array, falls back to the legacy `name` string, then to a generic
+ * "(untitled)" placeholder. Keep call sites short: `dataSourceDisplayName(ds)`.
+ */
+export function dataSourceDisplayName(
+  ds: Pick<NotionDataSourceObject, "name" | "title"> | null | undefined
+): string {
+  if (!ds) return "(untitled)";
+  if (Array.isArray(ds.title) && ds.title.length > 0) {
+    const joined = ds.title.map((r) => r?.plain_text ?? "").join("").trim();
+    if (joined) return joined;
+  }
+  if (typeof ds.name === "string" && ds.name.trim()) return ds.name;
+  return "(untitled)";
 }
 
 export interface NotionBlockObject {

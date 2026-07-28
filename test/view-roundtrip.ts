@@ -77,9 +77,11 @@ for (const fx of VIEW_FIXTURES) {
   try {
     const directives = parseViewDsl(fx.dsl);
     const resolver = fx.propIds ? makeResolver(fx.propIds) : undefined;
+    const typeResolver = fx.propTypes ? makeTypeResolver(fx.propTypes) : undefined;
     const body = emitViewBody(directives, {
       viewType: fx.viewType,
       ...(resolver ? { resolvePropertyId: resolver } : {}),
+      ...(typeResolver ? { resolvePropertyType: typeResolver } : {}),
     });
     const errors = deepSubset(body, fx.expected, "body");
     if (errors.length === 0) {
@@ -109,6 +111,17 @@ function makeResolver(map: Record<string, string>): (name: string) => string {
   };
 }
 
+/** Mirror of `makeTypeResolverFromProperties` in src/tools/views.ts — lookup
+ *  by name, return the Notion column type, or undefined when the name isn't
+ *  present. Undefined lets the emitter fall through to operator/value
+ *  inference (backwards-compat). */
+function makeTypeResolver(map: Record<string, string>): (name: string) => string | undefined {
+  return (name: string) => {
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    return undefined;
+  };
+}
+
 // -----------------------------------------------------------------------------
 // Error fixtures
 // -----------------------------------------------------------------------------
@@ -123,6 +136,7 @@ for (const fx of VIEW_ERROR_FIXTURES) {
     const emitCtx: Parameters<typeof emitViewBody>[1] = {};
     if (fx.viewType) emitCtx.viewType = fx.viewType;
     if (fx.propIds) emitCtx.resolvePropertyId = makeResolver(fx.propIds);
+    if (fx.propTypes) emitCtx.resolvePropertyType = makeTypeResolver(fx.propTypes);
     emitViewBody(directives, emitCtx);
   } catch (e) {
     threw = true;

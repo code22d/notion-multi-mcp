@@ -17,6 +17,11 @@ export interface ViewFixture {
    *  built from this map so property names rewrite to ids. Used to verify the
    *  follow-up #1 fix. */
   propIds?: Record<string, string>;
+  /** Optional resolver: name → Notion column type (e.g. "select", "number").
+   *  When present, the harness passes a `resolvePropertyType` into the
+   *  emitter so FILTER emission picks the right shape (regression for the
+   *  "FILTER on SELECT column emits rich_text" bug). */
+  propTypes?: Record<string, string>;
 }
 
 /** Optional fixture field — a property-name-to-id resolver. If present, the
@@ -374,6 +379,147 @@ GROUP BY STATUS "Lifecycle"`,
     },
   },
 
+  // ---- FILTER emits the right shape for the column's type (resolver path) ----
+  // Regression: before the fix, FILTER on a SELECT/STATUS/NUMBER/CHECKBOX/DATE
+  // column fell back to inference and produced `{rich_text: {equals: …}}`,
+  // which Notion 400s with "database property select does not match filter
+  // text". With a propTypes resolver, the emitter should now pick the matching
+  // filter shape.
+  {
+    name: "FILTER on SELECT column emits select-shaped condition (not rich_text)",
+    dsl: `FILTER "Status" = "Todo"`,
+    viewType: "table",
+    propTypes: { Status: "select" },
+    expected: {
+      filter: {
+        property: "Status",
+        select: { equals: "Todo" },
+      },
+    },
+  },
+  {
+    name: "FILTER on STATUS column emits status-shaped condition",
+    dsl: `FILTER "Lifecycle" = "In Progress"`,
+    viewType: "table",
+    propTypes: { Lifecycle: "status" },
+    expected: {
+      filter: {
+        property: "Lifecycle",
+        status: { equals: "In Progress" },
+      },
+    },
+  },
+  {
+    name: "FILTER on NUMBER column with > emits number greater_than",
+    dsl: `FILTER "Priority" > 3`,
+    viewType: "table",
+    propTypes: { Priority: "number" },
+    expected: {
+      filter: {
+        property: "Priority",
+        number: { greater_than: 3 },
+      },
+    },
+  },
+  {
+    name: "FILTER on CHECKBOX column with = true emits checkbox equals",
+    dsl: `FILTER "Done" = true`,
+    viewType: "table",
+    propTypes: { Done: "checkbox" },
+    expected: {
+      filter: {
+        property: "Done",
+        checkbox: { equals: true },
+      },
+    },
+  },
+  {
+    name: "FILTER on DATE column with BEFORE emits date before",
+    dsl: `FILTER "Due" BEFORE "2026-05-01"`,
+    viewType: "table",
+    propTypes: { Due: "date" },
+    expected: {
+      filter: {
+        property: "Due",
+        date: { before: "2026-05-01" },
+      },
+    },
+  },
+  {
+    name: "FILTER on MULTI_SELECT with CONTAINS emits multi_select contains",
+    dsl: `FILTER "Tags" CONTAINS "urgent"`,
+    viewType: "table",
+    propTypes: { Tags: "multi_select" },
+    expected: {
+      filter: {
+        property: "Tags",
+        multi_select: { contains: "urgent" },
+      },
+    },
+  },
+  {
+    name: "FILTER on PEOPLE column with CONTAINS emits people contains",
+    dsl: `FILTER "Owner" CONTAINS "user-123"`,
+    viewType: "table",
+    propTypes: { Owner: "people" },
+    expected: {
+      filter: {
+        property: "Owner",
+        people: { contains: "user-123" },
+      },
+    },
+  },
+  {
+    name: "FILTER on TITLE column with = emits title equals (not rich_text)",
+    dsl: `FILTER "Name" = "Invoice #42"`,
+    viewType: "table",
+    propTypes: { Name: "title" },
+    expected: {
+      filter: {
+        property: "Name",
+        title: { equals: "Invoice #42" },
+      },
+    },
+  },
+  {
+    name: "FILTER with unknown property name still falls back to inference (backwards-compat)",
+    dsl: `FILTER "MysteryProp" = "x"`,
+    viewType: "table",
+    propTypes: { Status: "select" }, // resolver knows about Status, not MysteryProp
+    expected: {
+      filter: {
+        property: "MysteryProp",
+        rich_text: { equals: "x" },
+      },
+    },
+  },
+  {
+    name: "explicit DSL type override beats the resolver",
+    dsl: `FILTER "Status" MULTI_SELECT CONTAINS "urgent"`,
+    viewType: "table",
+    propTypes: { Status: "select" }, // resolver says select — override should win
+    expected: {
+      filter: {
+        property: "Status",
+        multi_select: { contains: "urgent" },
+      },
+    },
+  },
+  {
+    name: "compound filter threads resolver through to each atom",
+    dsl: `FILTER ("Status" = "Done") AND ("Priority" > 3)`,
+    viewType: "table",
+    propTypes: { Status: "select", Priority: "number" },
+    expected: {
+      filter: {
+        and: [
+          { property: "Status", select: { equals: "Done" } },
+          { property: "Priority", number: { greater_than: 3 } },
+        ],
+      },
+    },
+  },
+
   // ---- Comments + trailing whitespace ----
   {
     name: "line comments and trailing semicolons",
@@ -397,6 +543,10 @@ export interface ViewErrorFixture {
   /** Optional resolver — if present, harness wires it in so we can test the
    *  "property not found" error path. */
   propIds?: Record<string, string>;
+  /** Optional type-resolver — lets error fixtures assert that unsupported
+   *  column types (FORMULA, ROLLUP, …) emit a clean tool-level error rather
+   *  than falling through to a Notion 400. */
+  propTypes?: Record<string, string>;
 }
 
 export const VIEW_ERROR_FIXTURES: ViewErrorFixture[] = [
@@ -468,5 +618,40 @@ FILTER "B" = "y"`,
     viewType: "board",
     propIds: { Status: "%7B%3FQf", Priority: "iTc%7C" },
     expectMessageMatches: /property "NotAProperty" not found.*"Status".*"Priority"/s,
+  },
+  {
+    name: "type-mismatch: > operator on a SELECT column → clean error",
+    dsl: `FILTER "Status" > 3`,
+    viewType: "table",
+    propTypes: { Status: "select" },
+    expectMessageMatches: /operator "greater_than" is not supported on select\/status/,
+  },
+  {
+    name: "type-mismatch: CONTAINS on a NUMBER column → clean error",
+    dsl: `FILTER "Score" CONTAINS "x"`,
+    viewType: "table",
+    propTypes: { Score: "number" },
+    expectMessageMatches: /operator "contains" is not supported on number/,
+  },
+  {
+    name: "FORMULA column → clean 'not yet supported' error",
+    dsl: `FILTER "Total" = "x"`,
+    viewType: "table",
+    propTypes: { Total: "formula" },
+    expectMessageMatches: /FORMULA columns is not yet supported/,
+  },
+  {
+    name: "ROLLUP column → clean 'not yet supported' error",
+    dsl: `FILTER "Count" = "x"`,
+    viewType: "table",
+    propTypes: { Count: "rollup" },
+    expectMessageMatches: /FILTER on rollup columns is not yet supported/,
+  },
+  {
+    name: "CREATED_TIME column filter → clean 'not yet supported' error",
+    dsl: `FILTER "Created" BEFORE "2026-01-01"`,
+    viewType: "table",
+    propTypes: { Created: "created_time" },
+    expectMessageMatches: /FILTER on created_time columns is not yet supported/,
   },
 ];

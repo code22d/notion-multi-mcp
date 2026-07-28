@@ -69,6 +69,15 @@ export function markdownToBlocks(markdown: string): BlockRequest[] {
       });
       continue;
     }
+    if (part.kind === "details_block") {
+      const summaryTokens = mdLexer
+        .lexer(part.summary || " ")
+        .flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
+      const body: Record<string, unknown> = { rich_text: toRichText(summaryTokens) };
+      if (part.body && part.body.trim() !== "") body.children = markdownToBlocks(part.body);
+      out.push({ type: "toggle", toggle: body });
+      continue;
+    }
     if (part.kind === "markdown") {
       const tokens = mdLexer.lexer(part.text) as TokensList;
       for (const tok of tokens) {
@@ -81,14 +90,57 @@ export function markdownToBlocks(markdown: string): BlockRequest[] {
 }
 
 // -----------------------------------------------------------------------------
-// Pre-processing: extract block equations `$$ … $$` out-of-band before lex.
-// Everything else (callouts, toggles, columns, mentions) lives inside markdown
-// tokens and is handled during the main walk.
+// Pre-processing: extract block equations `$$ … $$` and <details>…</details>
+// spans out-of-band before lex. Both are multi-line constructs that marked's
+// default paragraph rule tends to split across multiple tokens, so grabbing
+// them in one pass up-front gives us a single contiguous string for each.
 // -----------------------------------------------------------------------------
 
-type Segment = { kind: "markdown"; text: string } | { kind: "equation_block"; expression: string };
+type Segment =
+  | { kind: "markdown"; text: string }
+  | { kind: "equation_block"; expression: string }
+  | { kind: "details_block"; summary: string; body: string };
 
 function splitSpecialBlocks(source: string): Segment[] {
+  // First pass — extract <details>…</details> spans. These can straddle blank
+  // lines, which marked would otherwise tokenise as separate paragraphs.
+  const afterDetails = splitOnDetails(source);
+  // Second pass — within each `markdown`-kind segment, extract $$…$$ blocks.
+  const segments: Segment[] = [];
+  for (const seg of afterDetails) {
+    if (seg.kind !== "markdown") {
+      segments.push(seg);
+      continue;
+    }
+    segments.push(...splitOnEquations(seg.text));
+  }
+  if (segments.length === 0) segments.push({ kind: "markdown", text: source });
+  return segments;
+}
+
+function splitOnDetails(source: string): Segment[] {
+  // Match <details>[whitespace-tolerant]<summary>…</summary> … </details>
+  // across any number of intervening newlines / blank lines. Non-greedy on
+  // the body so nested <details> don't swallow the outer closer.
+  // Leading whitespace (incl. one or more spaces at line start) is allowed.
+  const re = /(^|\n)[ \t]*<details>\s*<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>[ \t]*(?=\n|$)/gi;
+  const segments: Segment[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source))) {
+    const before = source.slice(last, m.index + m[1]!.length);
+    if (before.trim() !== "") segments.push({ kind: "markdown", text: before });
+    const summary = (m[2] ?? "").trim();
+    const body = (m[3] ?? "").trim();
+    segments.push({ kind: "details_block", summary, body });
+    last = m.index + m[0].length;
+  }
+  const rest = source.slice(last);
+  if (rest.trim() !== "") segments.push({ kind: "markdown", text: rest });
+  return segments;
+}
+
+function splitOnEquations(source: string): Segment[] {
   const segments: Segment[] = [];
   // Match `$$` delimited blocks that occupy their own lines.
   const re = /(^|\n)\s*\$\$([\s\S]*?)\$\$\s*(?=\n|$)/g;
@@ -102,7 +154,6 @@ function splitSpecialBlocks(source: string): Segment[] {
   }
   const rest = source.slice(last);
   if (rest.trim() !== "") segments.push({ kind: "markdown", text: rest });
-  if (segments.length === 0) segments.push({ kind: "markdown", text: source });
   return segments;
 }
 

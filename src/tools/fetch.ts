@@ -15,7 +15,7 @@
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { resolveAccount, ACCOUNT_PARAM_SCHEMA } from "../accounts/resolver";
-import { NotionClient, stripDashes } from "../notion/client";
+import { NotionClient, dataSourceDisplayName, stripDashes } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 
 export function registerFetchTool(register: (def: ToolDef) => void): void {
@@ -54,21 +54,7 @@ async function fetchHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
 
   if (target.kind === "data_source") {
     const ds = await client.getDataSource(target.id);
-    return textBlock(
-      [
-        `# Data Source: ${ds.name}`,
-        `ID: ${ds.id}`,
-        `Parent database: ${ds.database_parent?.database_id ?? "(none)"}`,
-        "",
-        "## Schema",
-        describeProperties(ds.properties),
-        "",
-        "## Raw JSON",
-        "```json",
-        JSON.stringify(ds, null, 2),
-        "```",
-      ].join("\n")
-    );
+    return textBlock(formatDataSourceSummary(ds));
   }
 
   // Try page first — that's the most common case.
@@ -121,7 +107,7 @@ async function fetchHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
       if (db.data_sources && db.data_sources.length > 0) {
         parts.push("", "## Data Sources");
         for (const ds of db.data_sources) {
-          parts.push(`- ${ds.name} — collection://${ds.id}`);
+          parts.push(`- ${dataSourceDisplayName(ds)} — collection://${ds.id}`);
         }
       }
       parts.push("", "## Properties", describeProperties(db.properties));
@@ -234,4 +220,25 @@ function summarizeBlock(b: import("../notion/client").NotionBlockObject): string
 
 function textBlock(text: string): ToolResult {
   return { content: [{ type: "text", text }] };
+}
+
+/**
+ * Pure formatter for a data-source `notion_fetch` response. Exported so tests
+ * can assert the heading renders the correct name across legacy `name` and
+ * 2025-09-03 `title` (rich_text array) shapes, without needing a live client.
+ */
+export function formatDataSourceSummary(ds: import("../notion/client").NotionDataSourceObject): string {
+  return [
+    `# Data Source: ${dataSourceDisplayName(ds)}`,
+    `ID: ${ds.id}`,
+    `Parent database: ${ds.database_parent?.database_id ?? "(none)"}`,
+    "",
+    "## Schema",
+    describeProperties(ds.properties),
+    "",
+    "## Raw JSON",
+    "```json",
+    JSON.stringify(ds, null, 2),
+    "```",
+  ].join("\n");
 }

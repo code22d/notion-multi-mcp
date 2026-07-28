@@ -18,6 +18,13 @@
 import type { NotionClient } from "../../notion/client";
 import { textErr, textOk, normalizeIconInput, normalizeCoverInput } from "./shared";
 import type { ToolResult } from "../../mcp/types";
+import {
+  coerceScalarToPropertyValue,
+  needsTypeResolution,
+  resolveTypesForPage,
+  UNKNOWN_TYPES,
+  type PropertyTypeResolver,
+} from "../../notion/property-values";
 
 export interface UpdatePropertiesArgs {
   properties?: unknown;
@@ -36,7 +43,17 @@ export async function updatePropertiesHandler(
   // properties — only required when the command is update_properties; may be
   // empty for the other commands (cover/icon/archive set alongside any command).
   const propsRaw = args.properties;
-  const { notionProps, archived, inTrash, error } = normaliseProperties(propsRaw);
+
+  // Ask the schema what these columns actually are before serializing. Only
+  // worth a round trip when at least one value is an ambiguous bare string —
+  // numbers, booleans, arrays and native property objects already carry their
+  // own shape. Fails soft to the legacy heuristic (see property-values.ts).
+  let resolveType: PropertyTypeResolver = UNKNOWN_TYPES;
+  if (rawNeedsTypeResolution(propsRaw)) {
+    resolveType = await resolveTypesForPage(client, pageId);
+  }
+
+  const { notionProps, archived, inTrash, error } = normaliseProperties(propsRaw, resolveType);
   if (error) return textErr(error);
   if (notionProps && Object.keys(notionProps).length > 0) {
     body.properties = notionProps;
@@ -71,7 +88,28 @@ export interface NormalisedProps {
   error?: string;
 }
 
-export function normaliseProperties(raw: unknown): NormalisedProps {
+/** Pre-scan the flat property bag for values whose target shape we can't
+ *  determine without the schema. Mirrors the key handling in
+ *  normaliseProperties() below so we never fetch a schema we won't use. */
+export function rawNeedsTypeResolution(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return false;
+  const candidates: Record<string, unknown> = {};
+  for (const [rawKey, value] of Object.entries(raw as Record<string, unknown>)) {
+    // Composite keys declare their own intent — never ambiguous.
+    if (/^date:(.+):(start|end|is_datetime)$/.test(rawKey)) continue;
+    if (/^place:(.+):(name|address|latitude|longitude|google_place_id)$/.test(rawKey)) continue;
+    let key = rawKey;
+    if (key.startsWith("userDefined:")) key = key.slice("userDefined:".length);
+    if (key === "archived" || key === "in_trash") continue;
+    candidates[key] = value;
+  }
+  return needsTypeResolution(candidates);
+}
+
+export function normaliseProperties(
+  raw: unknown,
+  resolveType: PropertyTypeResolver = UNKNOWN_TYPES
+): NormalisedProps {
   if (raw === undefined || raw === null) return { notionProps: {} };
   if (typeof raw !== "object" || Array.isArray(raw)) {
     return { notionProps: {}, error: "`properties` must be an object." };
@@ -147,31 +185,10 @@ export function normaliseProperties(raw: unknown): NormalisedProps {
       continue;
     }
 
-    if (typeof value === "number") {
-      out[key] = { number: value };
-      continue;
-    }
-
-    if (typeof value === "boolean") {
-      out[key] = { checkbox: value };
-      continue;
-    }
-
-    if (typeof value === "string") {
-      if (value === "__YES__") {
-        out[key] = { checkbox: true };
-        continue;
-      }
-      if (value === "__NO__") {
-        out[key] = { checkbox: false };
-        continue;
-      }
-      // Title property gets title rich_text; everything else defaults to rich_text.
-      if (key.toLowerCase() === "title" || key === "Title" || key === "Name") {
-        out[key] = { title: [{ type: "text", text: { content: value } }] };
-      } else {
-        out[key] = { rich_text: [{ type: "text", text: { content: value } }] };
-      }
+    // Scalars — serialize against the column's real type when the schema told
+    // us one, otherwise fall back to the historical name/value heuristic.
+    if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") {
+      out[key] = coerceScalarToPropertyValue(key, value, resolveType(key));
       continue;
     }
 

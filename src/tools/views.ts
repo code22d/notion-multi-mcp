@@ -95,13 +95,20 @@ async function createViewHandler(args: Record<string, unknown>, ctx: ToolContext
     // CHART / SHOW / COVER-by-property), fetch the data source and build a
     // name → id resolver. Filter/sort-only DSLs skip the fetch.
     let resolvePropertyId: ((name: string) => string) | undefined;
-    if (directivesNeedIdResolution(directives)) {
+    let resolvePropertyType: ((name: string) => string | undefined) | undefined;
+    // Fetch the data source when we need id resolution for config directives
+    // OR type resolution for FILTER emission. One fetch, two resolvers.
+    const needsIds = directivesNeedIdResolution(directives);
+    const needsTypes = directivesNeedTypeResolution(directives);
+    if (needsIds || needsTypes) {
       const ds = await client.getDataSource(dataSourceId);
-      resolvePropertyId = makeResolverFromProperties(ds.properties);
+      if (needsIds) resolvePropertyId = makeResolverFromProperties(ds.properties);
+      if (needsTypes) resolvePropertyType = makeTypeResolverFromProperties(ds.properties);
     }
     body = emitViewBody(directives, {
       viewType: type,
       ...(resolvePropertyId !== undefined ? { resolvePropertyId } : {}),
+      ...(resolvePropertyType !== undefined ? { resolvePropertyType } : {}),
     });
   } catch (e) {
     return toolErrorFromDsl(e);
@@ -152,14 +159,16 @@ async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext
     (d) => d.kind !== "filter" && d.kind !== "sort"
   );
   const needsIdResolution = directivesNeedIdResolution(directives);
+  const needsTypeResolution = directivesNeedTypeResolution(directives);
 
   let viewType: ViewType | undefined;
   let resolvePropertyId: ((name: string) => string) | undefined;
-  if (needsViewType || needsIdResolution) {
+  let resolvePropertyType: ((name: string) => string | undefined) | undefined;
+  if (needsViewType || needsIdResolution || needsTypeResolution) {
     try {
       const existing = await client.getView(viewId);
       viewType = existing.type;
-      if (needsIdResolution) {
+      if (needsIdResolution || needsTypeResolution) {
         const dsId = existing.data_source_id;
         if (!dsId) {
           return textErr(
@@ -167,7 +176,8 @@ async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext
           );
         }
         const ds = await client.getDataSource(dsId);
-        resolvePropertyId = makeResolverFromProperties(ds.properties);
+        if (needsIdResolution) resolvePropertyId = makeResolverFromProperties(ds.properties);
+        if (needsTypeResolution) resolvePropertyType = makeTypeResolverFromProperties(ds.properties);
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -181,6 +191,7 @@ async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext
       viewType,
       forUpdate: true,
       ...(resolvePropertyId !== undefined ? { resolvePropertyId } : {}),
+      ...(resolvePropertyType !== undefined ? { resolvePropertyType } : {}),
     });
   } catch (e) {
     return toolErrorFromDsl(e);
@@ -257,6 +268,35 @@ function directivesNeedIdResolution(directives: DirectiveAst[]): boolean {
     }
   }
   return false;
+}
+
+/** Does this directive set include a FILTER that would benefit from column-
+ *  type resolution? Today every FILTER does — an explicit-type override in
+ *  the DSL simply shadows the resolver — so we trigger a data-source fetch
+ *  whenever a FILTER directive is present. */
+function directivesNeedTypeResolution(directives: DirectiveAst[]): boolean {
+  for (const d of directives) {
+    if (d.kind === "filter") return true;
+  }
+  return false;
+}
+
+/** Build a resolver (name → Notion column type, e.g. "select", "status") from
+ *  a data source's `properties` map. Returns undefined for names not present
+ *  so the emitter can fall back to inference; the emitter also accepts an id
+ *  in place of a name (unknown strings → undefined → inference). */
+function makeTypeResolverFromProperties(properties: Record<string, unknown>): (name: string) => string | undefined {
+  const map: Record<string, string> = {};
+  for (const [name, v] of Object.entries(properties ?? {})) {
+    if (v && typeof v === "object") {
+      const vv = v as { type?: unknown };
+      if (typeof vv.type === "string") map[name] = vv.type;
+    }
+  }
+  return (name: string) => {
+    if (Object.prototype.hasOwnProperty.call(map, name)) return map[name];
+    return undefined;
+  };
 }
 
 /** Build a resolver (name → property_id) from a data source's `properties`

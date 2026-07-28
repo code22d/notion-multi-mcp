@@ -31,17 +31,25 @@ export async function updateVerificationHandler(
     );
   }
 
-  const verification: Record<string, unknown> = { state: status };
-  if (status === "verified") {
-    const expiry = args.verification_expiry_days;
-    if (typeof expiry === "number" && Number.isFinite(expiry) && expiry > 0) {
-      const now = new Date();
-      const end = new Date(now.getTime() + expiry * 86400000);
-      verification.date = { start: now.toISOString(), end: end.toISOString() };
-    }
+  // Notion's public API only accepts a `verification` body on wiki-home pages.
+  // PATCHing it on a regular page returns:
+  //   "body failed validation: body.verification should be not present, instead was {...}"
+  // Pre-check so Claude sees a meaningful tool-level error instead of a raw 400.
+  let page;
+  try {
+    page = await client.getPage(pageId);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return textErr(`Could not load page ${pageId} to check wiki status: ${msg}`);
+  }
+  if (!page.is_wiki_page) {
+    return textErr(
+      `update_verification is only available on wiki home pages. Page ${pageId} is a regular page, so Notion's API rejects the verification body. ` +
+        `To verify content, convert the page to a wiki (Notion UI → "Turn into wiki") or target a page that is already a wiki home.`
+    );
   }
 
-  const body: Record<string, unknown> = { verification };
+  const body: Record<string, unknown> = { verification: buildVerificationPatch(args) };
   const icon = normalizeIconInput(args.icon);
   if (icon !== undefined) body.icon = icon;
   const cover = normalizeCoverInput(args.cover);
@@ -49,11 +57,31 @@ export async function updateVerificationHandler(
 
   await client.updatePage(pageId, body);
 
+  const verification = body.verification as { date?: { end?: string } };
   const expiryNote =
     status === "verified" && verification.date
-      ? ` (expires ${((verification.date as { end?: string }).end ?? "").slice(0, 10)})`
+      ? ` (expires ${(verification.date.end ?? "").slice(0, 10)})`
       : "";
   return textOk(`Set verification=${status}${expiryNote} on page ${pageId}.`);
+}
+
+/**
+ * Internal — pure verification-body builder shared with buildVerificationBody().
+ * Kept simple so the public buildVerificationBody() signature and its unit
+ * fixtures stay unchanged.
+ */
+function buildVerificationPatch(args: UpdateVerificationArgs, nowMs: number = Date.now()): Record<string, unknown> {
+  const status = args.verification_status;
+  const verification: Record<string, unknown> = { state: status };
+  if (status === "verified") {
+    const expiry = args.verification_expiry_days;
+    if (typeof expiry === "number" && Number.isFinite(expiry) && expiry > 0) {
+      const start = new Date(nowMs);
+      const end = new Date(nowMs + expiry * 86400000);
+      verification.date = { start: start.toISOString(), end: end.toISOString() };
+    }
+  }
+  return verification;
 }
 
 /**
