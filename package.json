@@ -12,11 +12,11 @@
     "test": "tsx test/roundtrip.ts && tsx test/ddl-roundtrip.ts && tsx test/view-roundtrip.ts && tsx test/duplicate-page.ts && tsx test/update-page-roundtrip.ts && tsx test/account-store.ts && tsx test/comments.ts && tsx test/bug-regressions.ts && tsx test/property-values.ts && tsx test/client-retry.ts && tsx test/oauth-tokens.ts && tsx test/api-surface.ts && tsx test/api-surface-2.ts"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20250419.0",
+    "@cloudflare/workers-types": "^5.20260728.1",
     "@notionhq/client": "^5.19.0",
     "tsx": "^4.21.0",
     "typescript": "^5.4.5",
-    "wrangler": "^3.114.0"
+    "wrangler": "^4.115.0"
   },
   "dependencies": {
     "marked": "^18.0.2"
