@@ -221,16 +221,76 @@ console.log("\n[429] a real Headers object works too");
 // Fallback to exponential backoff
 // -----------------------------------------------------------------------------
 
-console.log("\n[429] no Retry-After ⇒ original 100/400/900 curve");
+// NOTE: this case previously fed three 429s and asserted sleeps [100, 400, 900],
+// which only passes if an unheadered 429 is allowed 4+ attempts. That budget was
+// the bug the audit caught — blind retries against a workspace-level limit spend
+// requests we're already over on. The fallback CURVE is unchanged (100, 400, …);
+// only the number of attempts it gets to walk shrank back to 3.
+console.log("\n[429] no Retry-After ⇒ original backoff curve, within the default budget");
 {
   const h = harness([
-    { status: 429, body: errBody("rate limited") },
     { status: 429, body: errBody("rate limited") },
     { status: 429, body: errBody("rate limited") },
     { status: 200, body: { ok: true } },
   ]);
   await h.client.request("/pages/x");
-  eq(h.sleeps, [100, 400, 900], "fell back to the pre-existing backoff curve");
+  eq(h.sleeps, [100, 400], "fell back to the pre-existing backoff curve");
+  eq(h.calls(), 3, "succeeded on the third and final permitted attempt");
+}
+
+// The attempt budget turns on the presence of Retry-After, not the status class.
+// Retrying blind against a workspace-level rate limit spends requests we're
+// already over budget on, so an unheadered 429 must NOT get the larger budget.
+console.log("\n[429] attempt budget depends on Retry-After, not on the status");
+{
+  // No header anywhere: exhausts the DEFAULT budget (3 attempts ⇒ 2 sleeps).
+  const h = harness([
+    { status: 429, body: errBody("rate limited") },
+    { status: 429, body: errBody("rate limited") },
+    { status: 429, body: errBody("rate limited") },
+    { status: 429, body: errBody("rate limited") },
+    { status: 429, body: errBody("rate limited") },
+    { status: 200, body: { ok: true } },
+  ]);
+  let threw = false;
+  try {
+    await h.client.request("/pages/x");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "unheadered 429 gave up rather than retrying indefinitely");
+  eq(h.calls(), 3, "unheadered 429 sent 3 requests, not 5 (blind retries stay cheap)");
+  eq(h.sleeps, [100, 400], "…with the original two backoff sleeps");
+}
+{
+  // Same failure count, but Notion named the window: earns the larger budget.
+  const h = harness([
+    { status: 429, body: errBody("rate limited"), headers: { "Retry-After": "1" } },
+    { status: 429, body: errBody("rate limited"), headers: { "Retry-After": "1" } },
+    { status: 429, body: errBody("rate limited"), headers: { "Retry-After": "1" } },
+    { status: 429, body: errBody("rate limited"), headers: { "Retry-After": "1" } },
+    { status: 200, body: { ok: true } },
+  ]);
+  await h.client.request("/pages/x");
+  eq(h.calls(), 5, "headered 429 used the full 5-attempt budget and succeeded");
+  eq(h.sleeps, [1000, 1000, 1000, 1000], "…sleeping exactly the advertised delay each time");
+}
+{
+  // A 5xx never earns the larger budget, even carrying Retry-After.
+  const h = harness([
+    { status: 503, body: errBody("unavailable"), headers: { "Retry-After": "1" } },
+    { status: 503, body: errBody("unavailable"), headers: { "Retry-After": "1" } },
+    { status: 503, body: errBody("unavailable"), headers: { "Retry-After": "1" } },
+    { status: 200, body: { ok: true } },
+  ]);
+  let threw = false;
+  try {
+    await h.client.request("/pages/x");
+  } catch {
+    threw = true;
+  }
+  assert(threw, "5xx exhausted its budget");
+  eq(h.calls(), 3, "5xx kept the 3-attempt budget even with Retry-After present");
 }
 
 console.log("\n[429] malformed Retry-After ⇒ backoff, not a hard failure");

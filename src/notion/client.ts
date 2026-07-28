@@ -23,13 +23,18 @@ export const NOTION_VERSION = "2025-09-03";
 // Several connectors share this workspace's budget, so 429s are realistic and
 // Notion's advertised delay can far exceed the old fixed 1.4s backoff ceiling.
 //
-// Attempt counts differ by class, because the two failures mean different
-// things:
-//   - 429 gets MAX_ATTEMPTS_429 tries. When Notion tells us exactly how long to
-//     wait, sleeping that long and retrying is very likely to succeed, so extra
-//     attempts are cheap in expectation.
-//   - 5xx gets MAX_ATTEMPTS_5XX tries (unchanged from the original code). A
-//     server error carries no promise that waiting helps.
+// The attempt budget turns on whether the response told us WHEN to come back,
+// not on the status class:
+//   - A 429 carrying Retry-After gets MAX_ATTEMPTS_RETRY_AFTER tries. Notion has
+//     named the moment the request will succeed, so sleeping that long and
+//     retrying is very likely to work — extra attempts are cheap in expectation.
+//   - Everything else retriable (5xx, and a 429 with no Retry-After) gets
+//     MAX_ATTEMPTS_DEFAULT tries, the original count. Those retries are blind.
+//     Raising the budget for an unheadered 429 would be self-defeating: it spends
+//     extra requests against a workspace-level limit we're already over, making
+//     contention worse for every other connector sharing the budget — the exact
+//     failure this policy exists to soften. A 5xx carries no promise that waiting
+//     helps at all.
 //
 // Two ceilings bound the worst case, because a Cloudflare Worker cannot sleep
 // indefinitely — the MCP client's HTTP request is held open the whole time:
@@ -39,8 +44,8 @@ export const NOTION_VERSION = "2025-09-03";
 // Exceeding either is surfaced as a clear error naming the advertised delay,
 // rather than silently clamping and retrying too early (which would just burn
 // another request against the limit we're already over).
-const MAX_ATTEMPTS_429 = 5;
-const MAX_ATTEMPTS_5XX = 3;
+const MAX_ATTEMPTS_RETRY_AFTER = 5;
+const MAX_ATTEMPTS_DEFAULT = 3;
 const MAX_SINGLE_SLEEP_MS = 60_000;
 const MAX_TOTAL_SLEEP_MS = 60_000;
 
@@ -110,9 +115,9 @@ export class NotionClient {
     // Token refresh is attempted at most once per request. Without this latch
     // a permanently-rejected token would loop: refresh, 401, refresh, 401.
     let refreshAttempted = false;
-    // Bound the loop by the larger of the two budgets; the per-class check
-    // inside decides when to actually give up.
-    const maxAttempts = Math.max(MAX_ATTEMPTS_429, MAX_ATTEMPTS_5XX);
+    // Bound the loop by the larger of the two budgets; the check inside decides
+    // when to actually give up, based on whether a Retry-After was present.
+    const maxAttempts = Math.max(MAX_ATTEMPTS_RETRY_AFTER, MAX_ATTEMPTS_DEFAULT);
     while (attempt < maxAttempts) {
       const res = await this.fetchImpl(url.toString(), { method, headers, body });
       if (res.ok) {
@@ -156,12 +161,20 @@ export class NotionClient {
 
       lastError = new Error(`Notion API ${res.status}: ${msg}`);
       attempt++;
-      const attemptsForClass = isRateLimited ? MAX_ATTEMPTS_429 : MAX_ATTEMPTS_5XX;
-      if (attempt >= attemptsForClass) break;
+
+      // Read the advertised delay BEFORE choosing the attempt budget — the budget
+      // depends on whether Notion named a retry window, not just on the status.
+      const advertised = parseRetryAfterMs(readHeader(res, "retry-after"), this.nowImpl());
+
+      // Only a 429 that told us when to come back earns the larger budget. An
+      // unheadered 429 retries blind, so it keeps the original count rather than
+      // spending extra requests against a limit we're already over.
+      const attemptsAllowed =
+        isRateLimited && advertised !== null ? MAX_ATTEMPTS_RETRY_AFTER : MAX_ATTEMPTS_DEFAULT;
+      if (attempt >= attemptsAllowed) break;
 
       // Prefer Notion's advertised delay; fall back to the original
       // exponential curve (100ms, 400ms, 900ms, …) when the header is absent.
-      const advertised = parseRetryAfterMs(readHeader(res, "retry-after"), this.nowImpl());
       let waitMs: number;
       if (advertised !== null) {
         if (advertised > MAX_SINGLE_SLEEP_MS) {
