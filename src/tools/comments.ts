@@ -67,6 +67,141 @@ export function registerCommentTools(register: (def: ToolDef) => void): void {
     },
     handler: getCommentsHandler,
   });
+
+  register({
+    name: "notion_update_comment",
+    description:
+      "Update the text of an existing Notion comment (PATCH /v1/comments/:id). " +
+      "IMPORTANT: an integration can only update comments IT created — Notion returns 404 for anyone else's comment, " +
+      "even one you can read. Only Data-Loss-Prevention (DLP) integrations can modify comments they did not author.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...ACCOUNT_PARAM_SCHEMA,
+        comment_id: { type: "string", description: "Id of the comment to update." },
+        text: { type: "string", description: "Replacement comment text (plain text)." },
+        rich_text: {
+          type: "array",
+          description: "Array of Notion rich_text objects — use instead of `text` for formatting.",
+        },
+      },
+      required: ["account", "comment_id"],
+      additionalProperties: false,
+    },
+    handler: updateCommentHandler,
+  });
+
+  register({
+    name: "notion_delete_comment",
+    description:
+      "Delete a Notion comment (DELETE /v1/comments/:id). " +
+      "IMPORTANT: an integration can only delete comments IT created — Notion returns 404 for anyone else's comment. " +
+      "Only Data-Loss-Prevention (DLP) integrations can delete comments they did not author.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...ACCOUNT_PARAM_SCHEMA,
+        comment_id: { type: "string", description: "Id of the comment to delete." },
+      },
+      required: ["account", "comment_id"],
+      additionalProperties: false,
+    },
+    handler: deleteCommentHandler,
+  });
+}
+
+/**
+ * Translate Notion's opaque failures on comment PATCH/DELETE into an
+ * actionable message, in the style of the getComments 404 hint above.
+ *
+ * Two distinct causes hide behind two indistinguishable-looking errors:
+ *
+ *   404 — almost always "this comment was created by someone else". Notion
+ *         does not distinguish "no such comment" from "not yours"; a non-DLP
+ *         integration simply cannot see other authors' comments as mutable.
+ *         Left as a bare 404 this reads as a bad id, and the user goes hunting
+ *         for a typo that isn't there.
+ *   403 — the integration lacks the "Insert comments" capability. Both PATCH
+ *         and DELETE are gated on it, which is not obvious from their names.
+ *
+ * Anything else passes through unchanged.
+ */
+export function explainCommentMutationError(err: unknown, verb: "update" | "delete", commentId: string): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  if (/^Notion API 404\b/.test(msg)) {
+    return (
+      `Could not ${verb} comment ${commentId}: Notion returned 404.\n\n` +
+      `The most likely cause is NOT a bad id — a non-DLP integration can only ${verb} comments that IT created, ` +
+      `and Notion returns 404 (not 403) for a comment authored by another user or connection. ` +
+      `If this comment was written by a person in the Notion UI, or by a different integration, this endpoint cannot ${verb} it.\n\n` +
+      `If you did create it via this connection, re-check the comment id.\n\n` +
+      `Original error: ${msg}`
+    );
+  }
+  if (/^Notion API 403\b/.test(msg)) {
+    return (
+      `Could not ${verb} comment ${commentId}: Notion returned 403.\n\n` +
+      `Both PATCH and DELETE on comments require the "Insert comments" capability — the name is misleading, ` +
+      `it gates all comment WRITES, not just creation. ` +
+      `Enable it at https://www.notion.so/profile/integrations — open the integration, go to Capabilities, ` +
+      `and tick "Insert comments".\n\n` +
+      `Original error: ${msg}`
+    );
+  }
+  return `notion_${verb}_comment failed: ${msg}`;
+}
+
+async function updateCommentHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const account = await resolveAccount(args, ctx);
+  const client = createNotionClient(account, ctx);
+
+  const commentId = typeof args.comment_id === "string" ? args.comment_id.trim() : "";
+  if (!commentId) {
+    return { isError: true, content: [{ type: "text", text: "`comment_id` is required." }] };
+  }
+
+  const rich: NotionRichText[] = Array.isArray(args.rich_text)
+    ? (args.rich_text as NotionRichText[])
+    : plainToRichText(String(args.text ?? ""));
+  if (rich.length === 0) {
+    return {
+      isError: true,
+      content: [{ type: "text", text: "Provide either `text` or a non-empty `rich_text` array." }],
+    };
+  }
+
+  try {
+    const updated = await client.updateComment(commentId, { rich_text: rich });
+    // Same partial-response hazard as create: prefer what we sent when the
+    // response omits fields. See formatCreateCommentResult.
+    const body =
+      Array.isArray((updated as { rich_text?: unknown }).rich_text) &&
+      (updated as { rich_text: NotionRichText[] }).rich_text.length > 0
+        ? richTextToMarkdown((updated as { rich_text: NotionRichText[] }).rich_text)
+        : richTextToMarkdown(rich);
+    return {
+      content: [{ type: "text", text: `✅ Updated comment ${commentId}\nText: ${body}` }],
+    };
+  } catch (e) {
+    return { isError: true, content: [{ type: "text", text: explainCommentMutationError(e, "update", commentId) }] };
+  }
+}
+
+async function deleteCommentHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const account = await resolveAccount(args, ctx);
+  const client = createNotionClient(account, ctx);
+
+  const commentId = typeof args.comment_id === "string" ? args.comment_id.trim() : "";
+  if (!commentId) {
+    return { isError: true, content: [{ type: "text", text: "`comment_id` is required." }] };
+  }
+
+  try {
+    await client.deleteComment(commentId);
+    return { content: [{ type: "text", text: `✅ Deleted comment ${commentId}` }] };
+  } catch (e) {
+    return { isError: true, content: [{ type: "text", text: explainCommentMutationError(e, "delete", commentId) }] };
+  }
 }
 
 // -----------------------------------------------------------------------------

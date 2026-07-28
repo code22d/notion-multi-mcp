@@ -41,8 +41,23 @@
 //   "Prop" IS NOT EMPTY
 //   "Prop" IS CHECKED
 //   "Prop" IS UNCHECKED
-//   "Prop" IN ("v1", "v2")     multi_select / select equality
+//   "Prop" IN ("v1", "v2")     multi-value match  (select/status: equals []
+//                              · multi_select: contains [])
+//   "Prop" NOT IN ("v1", "v2") multi-value exclusion (select/status:
+//                              does_not_equal [] · multi_select:
+//                              does_not_contain [])
 //   TIMESTAMP "created_time" BEFORE "2026-01-01"
+//
+// Relative dates (bare keywords, date columns only):
+//
+//   "Due" ON OR AFTER TODAY
+//   "Due" BEFORE ONE_WEEK_FROM_NOW
+//   TODAY · TOMORROW · YESTERDAY · ONE_WEEK_AGO · ONE_WEEK_FROM_NOW ·
+//   ONE_MONTH_AGO · ONE_MONTH_FROM_NOW
+//
+// Current-user people filter (people columns only):
+//
+//   "Assignee" CONTAINS ME
 //
 // Type prefix override (when default inference is wrong):
 //
@@ -112,7 +127,31 @@ export type FilterValue =
   | { kind: "string"; value: string }
   | { kind: "number"; value: number }
   | { kind: "boolean"; value: boolean }
-  | { kind: "list"; values: Array<string | number> };
+  | { kind: "list"; values: Array<string | number> }
+  // A relative-date keyword (2026-03-30). Kept as its own kind rather than a
+  // plain string so the emitter can REJECT it on non-date columns: `"Name" =
+  // TODAY` would otherwise silently become a literal text search for the word
+  // "today", which matches nothing and looks like a Notion bug.
+  | { kind: "relative_date"; value: RelativeDateValue }
+  // The `me` people-filter token (2026-03-30). Same reasoning — restricted to
+  // people columns at emit time.
+  | { kind: "me" };
+
+/**
+ * Relative date values Notion accepts on `equals`, `before`, `after`,
+ * `on_or_before` and `on_or_after` since 2026-03-30. Resolved server-side
+ * against the workspace's timezone, so we pass them straight through.
+ */
+export const RELATIVE_DATE_VALUES = [
+  "today",
+  "tomorrow",
+  "yesterday",
+  "one_week_ago",
+  "one_week_from_now",
+  "one_month_ago",
+  "one_month_from_now",
+] as const;
+export type RelativeDateValue = (typeof RELATIVE_DATE_VALUES)[number];
 
 /** Operator atoms recognised by the parser. */
 export type FilterOperator =
@@ -134,7 +173,8 @@ export type FilterOperator =
   | "is_not_empty"
   | "is_checked"
   | "is_unchecked"
-  | "in";
+  | "in"
+  | "not_in";
 
 /**
  * Filter-property types we accept as an explicit override. Matches the keys

@@ -533,6 +533,200 @@ SORT BY "Created" DESC;`,
       sorts: [{ property: "Created", direction: "descending" }],
     },
   },
+
+  // ---------------------------------------------------------------------
+  // Multi-value filters (Notion 2026-04-17: select/status equals and
+  // does_not_equal, and multi_select contains and does_not_contain, all
+  // accept arrays). DSL spelling: IN (…) and NOT IN (…).
+  // ---------------------------------------------------------------------
+  {
+    name: "IN on a select column ⇒ equals: [array]",
+    dsl: `FILTER "Priority" IN ("Low", "Medium")`,
+    viewType: "table",
+    propTypes: { Priority: "select" },
+    expected: { filter: { property: "Priority", select: { equals: ["Low", "Medium"] } } },
+  },
+  {
+    name: "NOT IN on a select column ⇒ does_not_equal: [array]",
+    dsl: `FILTER "Priority" NOT IN ("Low", "Medium")`,
+    viewType: "table",
+    propTypes: { Priority: "select" },
+    expected: { filter: { property: "Priority", select: { does_not_equal: ["Low", "Medium"] } } },
+  },
+  {
+    name: "IN on a status column ⇒ equals: [array]",
+    dsl: `FILTER "Project status" IN ("To-do", "In progress")`,
+    viewType: "table",
+    propTypes: { "Project status": "status" },
+    expected: { filter: { property: "Project status", status: { equals: ["To-do", "In progress"] } } },
+  },
+  {
+    name: "NOT IN on a status column ⇒ does_not_equal: [array]",
+    dsl: `FILTER "Project status" NOT IN ("Done")`,
+    viewType: "table",
+    propTypes: { "Project status": "status" },
+    expected: { filter: { property: "Project status", status: { does_not_equal: ["Done"] } } },
+  },
+  {
+    name: "IN on a multi_select column ⇒ contains: [array]",
+    dsl: `FILTER "Skills" IN ("Python", "JavaScript")`,
+    viewType: "table",
+    propTypes: { Skills: "multi_select" },
+    expected: { filter: { property: "Skills", multi_select: { contains: ["Python", "JavaScript"] } } },
+  },
+  {
+    name: "NOT IN on a multi_select column ⇒ does_not_contain: [array]",
+    dsl: `FILTER "Skills" NOT IN ("COBOL")`,
+    viewType: "table",
+    propTypes: { Skills: "multi_select" },
+    expected: { filter: { property: "Skills", multi_select: { does_not_contain: ["COBOL"] } } },
+  },
+  {
+    name: "IN with no type resolver still infers multi_select (unchanged legacy behaviour)",
+    dsl: `FILTER "Tags" IN ("a", "b")`,
+    viewType: "table",
+    expected: { filter: { property: "Tags", multi_select: { contains: ["a", "b"] } } },
+  },
+  {
+    name: "IN coerces numeric list items to strings",
+    dsl: `FILTER "Level" IN (1, 2, 3)`,
+    viewType: "table",
+    propTypes: { Level: "select" },
+    expected: { filter: { property: "Level", select: { equals: ["1", "2", "3"] } } },
+  },
+  {
+    name: "single-value equality on select is UNCHANGED by the multi-value work",
+    dsl: `FILTER "Priority" = "Low"`,
+    viewType: "table",
+    propTypes: { Priority: "select" },
+    expected: { filter: { property: "Priority", select: { equals: "Low" } } },
+  },
+  {
+    name: "multi-value combines with AND",
+    dsl: `FILTER ("Priority" IN ("Low", "High")) AND ("Skills" NOT IN ("COBOL"))`,
+    viewType: "table",
+    propTypes: { Priority: "select", Skills: "multi_select" },
+    expected: {
+      filter: {
+        and: [
+          { property: "Priority", select: { equals: ["Low", "High"] } },
+          { property: "Skills", multi_select: { does_not_contain: ["COBOL"] } },
+        ],
+      },
+    },
+  },
+
+  // ---------------------------------------------------------------------
+  // Relative date values (Notion 2026-03-30). Passed through verbatim —
+  // Notion resolves them in the workspace timezone, so computing a date in
+  // the Worker would bake in UTC and drift from the UI.
+  // ---------------------------------------------------------------------
+  {
+    name: "ON OR AFTER TODAY",
+    dsl: `FILTER "Due date" ON OR AFTER TODAY`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { on_or_after: "today" } } },
+  },
+  {
+    name: "BEFORE ONE_WEEK_FROM_NOW",
+    dsl: `FILTER "Due date" BEFORE ONE_WEEK_FROM_NOW`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { before: "one_week_from_now" } } },
+  },
+  {
+    name: "AFTER ONE_MONTH_AGO",
+    dsl: `FILTER "Due date" AFTER ONE_MONTH_AGO`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { after: "one_month_ago" } } },
+  },
+  {
+    name: "= YESTERDAY",
+    dsl: `FILTER "Due date" = YESTERDAY`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { equals: "yesterday" } } },
+  },
+  {
+    name: "ON OR BEFORE TOMORROW",
+    dsl: `FILTER "Due date" ON OR BEFORE TOMORROW`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { on_or_before: "tomorrow" } } },
+  },
+  {
+    name: "ONE_WEEK_AGO / ONE_MONTH_FROM_NOW round-trip",
+    dsl: `FILTER ("A" AFTER ONE_WEEK_AGO) AND ("B" BEFORE ONE_MONTH_FROM_NOW)`,
+    viewType: "table",
+    propTypes: { A: "date", B: "date" },
+    expected: {
+      filter: {
+        and: [
+          { property: "A", date: { after: "one_week_ago" } },
+          { property: "B", date: { before: "one_month_from_now" } },
+        ],
+      },
+    },
+  },
+  {
+    name: "relative date pins the type even with no resolver (= TODAY ⇒ date, not rich_text)",
+    dsl: `FILTER "Due" = TODAY`,
+    viewType: "table",
+    expected: { filter: { property: "Due", date: { equals: "today" } } },
+  },
+  {
+    name: "an ISO date string still works alongside relative values",
+    dsl: `FILTER "Due date" BEFORE "2026-01-01"`,
+    viewType: "table",
+    propTypes: { "Due date": "date" },
+    expected: { filter: { property: "Due date", date: { before: "2026-01-01" } } },
+  },
+  {
+    name: "quoting a relative keyword makes it a literal string (escape hatch)",
+    dsl: `FILTER "Name" = 'today'`,
+    viewType: "table",
+    propTypes: { Name: "rich_text" },
+    expected: { filter: { property: "Name", rich_text: { equals: "today" } } },
+  },
+
+  // ---------------------------------------------------------------------
+  // "me" people filter (Notion 2026-03-30).
+  // ---------------------------------------------------------------------
+  {
+    name: "CONTAINS ME on a people column",
+    dsl: `FILTER "Assignee" CONTAINS ME`,
+    viewType: "table",
+    propTypes: { Assignee: "people" },
+    expected: { filter: { property: "Assignee", people: { contains: "me" } } },
+  },
+  {
+    name: "ME pins the type to people even with no resolver",
+    dsl: `FILTER "Assignee" CONTAINS ME`,
+    viewType: "table",
+    expected: { filter: { property: "Assignee", people: { contains: "me" } } },
+  },
+  {
+    name: "explicit PEOPLE override with ME",
+    dsl: `FILTER "Owner" PEOPLE CONTAINS ME`,
+    viewType: "table",
+    expected: { filter: { property: "Owner", people: { contains: "me" } } },
+  },
+  {
+    name: "a literal user id on a people column is unchanged",
+    dsl: `FILTER "Assignee" CONTAINS "user-abc-123"`,
+    viewType: "table",
+    propTypes: { Assignee: "people" },
+    expected: { filter: { property: "Assignee", people: { contains: "user-abc-123" } } },
+  },
+  {
+    name: "quoting me makes it a literal string",
+    dsl: `FILTER "Assignee" CONTAINS 'me'`,
+    viewType: "table",
+    propTypes: { Assignee: "people" },
+    expected: { filter: { property: "Assignee", people: { contains: "me" } } },
+  },
 ];
 
 export interface ViewErrorFixture {
@@ -653,5 +847,82 @@ FILTER "B" = "y"`,
     viewType: "table",
     propTypes: { Created: "created_time" },
     expectMessageMatches: /FILTER on created_time columns is not yet supported/,
+  },
+
+  // ---- Multi-value / relative-date / ME misuse ----
+  {
+    name: "IN without a parenthesised list",
+    dsl: `FILTER "Priority" IN "Low"`,
+    viewType: "table",
+    expectMessageMatches: /expected LPAREN/,
+  },
+  {
+    name: "NOT without IN points at IS NOT EMPTY",
+    dsl: `FILTER "Priority" NOT "Low"`,
+    viewType: "table",
+    expectMessageMatches: /expected IN after NOT.*IS NOT EMPTY/,
+  },
+  {
+    name: "IN on a text column → clean error naming the type",
+    dsl: `FILTER "Name" IN ("a", "b")`,
+    viewType: "table",
+    propTypes: { Name: "rich_text" },
+    expectMessageMatches: /operator "in" is not supported on text properties/,
+  },
+  {
+    name: "NOT IN on a number column → clean error",
+    dsl: `FILTER "Score" NOT IN (1, 2)`,
+    viewType: "table",
+    propTypes: { Score: "number" },
+    expectMessageMatches: /operator "not_in" is not supported on number/,
+  },
+  {
+    name: "relative date on a text column tells you to quote it",
+    dsl: `FILTER "Name" = TODAY`,
+    viewType: "table",
+    propTypes: { Name: "rich_text" },
+    expectMessageMatches: /TODAY is a relative-date value and is only valid on DATE properties.*Quote it/s,
+  },
+  {
+    name: "relative date on a people column is rejected",
+    dsl: `FILTER "Assignee" CONTAINS TODAY`,
+    viewType: "table",
+    propTypes: { Assignee: "people" },
+    expectMessageMatches: /TODAY is a relative-date value and cannot be used on a people\/relation property/,
+  },
+  {
+    name: "ME on a text column tells you to quote it",
+    dsl: `FILTER "Name" = ME`,
+    viewType: "table",
+    propTypes: { Name: "rich_text" },
+    expectMessageMatches: /ME is only valid on PEOPLE properties.*Quote it/s,
+  },
+  {
+    name: "ME on a relation column is rejected with an actionable alternative",
+    dsl: `FILTER "Project" CONTAINS ME`,
+    viewType: "table",
+    propTypes: { Project: "relation" },
+    expectMessageMatches: /ME is only valid on people properties.*related page's id/s,
+  },
+  {
+    name: "ME on a date column is rejected",
+    dsl: `FILTER "Due" BEFORE ME`,
+    viewType: "table",
+    propTypes: { Due: "date" },
+    expectMessageMatches: /ME is a people-filter value and cannot be used on a date property/,
+  },
+  {
+    name: "empty IN list",
+    dsl: `FILTER "Priority" IN ()`,
+    viewType: "table",
+    propTypes: { Priority: "select" },
+    expectMessageMatches: /expected a value/,
+  },
+  {
+    name: "a single-value operator given a list points at IN",
+    dsl: `FILTER "Due" BEFORE ("a", "b")`,
+    viewType: "table",
+    propTypes: { Due: "date" },
+    expectMessageMatches: /expected a value/,
   },
 ];

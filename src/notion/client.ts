@@ -362,6 +362,284 @@ export class NotionClient {
   updateView(viewId: string, body: unknown): Promise<NotionViewObject> {
     return this.request<NotionViewObject>(`/views/${stripDashes(viewId)}`, { method: "PATCH", body });
   }
+
+  /**
+   * DELETE /v1/views/{id}
+   *
+   * Returns a PARTIAL view object — identity fields only (`object`, `id`,
+   * `parent`, `type`). Don't expect `name` or `url` back.
+   */
+  deleteView(viewId: string): Promise<Partial<NotionViewObject> & { object: "view"; id: string }> {
+    return this.request(`/views/${stripDashes(viewId)}`, { method: "DELETE" });
+  }
+
+  /**
+   * GET /v1/views?database_id=… | ?data_source_id=…
+   *
+   * At least one of the two ids is required. Results are MINIMAL view
+   * references (`{ object: "view", id }`) — call getView() on each id for the
+   * full object.
+   */
+  listViews(opts: {
+    databaseId?: string;
+    dataSourceId?: string;
+    startCursor?: string;
+    pageSize?: number;
+  }): Promise<PaginatedList<{ object: "view"; id: string }>> {
+    return this.request(`/views`, {
+      query: {
+        database_id: opts.databaseId ? stripDashes(opts.databaseId) : undefined,
+        data_source_id: opts.dataSourceId ? stripDashes(opts.dataSourceId) : undefined,
+        start_cursor: opts.startCursor,
+        page_size: opts.pageSize,
+      },
+    });
+  }
+
+  /**
+   * POST /v1/views/{id}/queries — run the view's own filters/sorts.
+   *
+   * Notion caches the full result set server-side and hands back the first
+   * page plus a query id. The cache expires 15 minutes after creation; paging
+   * against an expired query 404s. Callers that finish early should call
+   * deleteViewQuery() to release it.
+   */
+  createViewQuery(
+    viewId: string,
+    body: { page_size?: number } = {}
+  ): Promise<NotionViewQueryObject> {
+    return this.request<NotionViewQueryObject>(`/views/${stripDashes(viewId)}/queries`, {
+      method: "POST",
+      body,
+    });
+  }
+
+  /** GET /v1/views/{id}/queries/{query_id} — page through a cached view query. */
+  getViewQueryResults(
+    viewId: string,
+    queryId: string,
+    opts: { startCursor?: string; pageSize?: number } = {}
+  ): Promise<PaginatedList<{ object: "page"; id: string }>> {
+    return this.request(`/views/${stripDashes(viewId)}/queries/${stripDashes(queryId)}`, {
+      query: { start_cursor: opts.startCursor, page_size: opts.pageSize },
+    });
+  }
+
+  /** DELETE /v1/views/{id}/queries/{query_id} — release the cached result set. */
+  deleteViewQuery(viewId: string, queryId: string): Promise<{ deleted?: boolean }> {
+    return this.request(`/views/${stripDashes(viewId)}/queries/${stripDashes(queryId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  /**
+   * Run a view's query and collect every page of results.
+   *
+   * Stops at `maxResults` so a 10k-row view can't blow the Worker's memory or
+   * wall-clock budget, and reports BOTH truncation causes distinctly:
+   *   - `incomplete` — Notion itself capped the set (request_status)
+   *   - `truncatedLocally` — we stopped early at maxResults
+   * Silently returning a short list for either reason is exactly the failure
+   * mode the 2026-04-20 request_status change exists to prevent.
+   */
+  async queryViewAll(
+    viewId: string,
+    opts: { pageSize?: number; maxResults?: number } = {}
+  ): Promise<CollectedPages<{ object: "page"; id: string }> & { totalCount?: number }> {
+    const maxResults = opts.maxResults ?? 1000;
+    const first = await this.createViewQuery(viewId, opts.pageSize ? { page_size: opts.pageSize } : {});
+    const results: Array<{ object: "page"; id: string }> = [...(first.results ?? [])];
+    let incomplete = incompleteStatusOf(first);
+    let truncatedLocally = false;
+    let cursor = first.has_more ? (first.next_cursor ?? undefined) : undefined;
+
+    try {
+      while (cursor && results.length < maxResults) {
+        const page = await this.getViewQueryResults(viewId, first.id, {
+          startCursor: cursor,
+          ...(opts.pageSize !== undefined ? { pageSize: opts.pageSize } : {}),
+        });
+        results.push(...page.results);
+        incomplete = incomplete ?? incompleteStatusOf(page);
+        cursor = page.has_more ? (page.next_cursor ?? undefined) : undefined;
+      }
+      if (cursor) truncatedLocally = true;
+    } finally {
+      // Best-effort cache release. A failure here is harmless — the cache
+      // expires on its own after 15 minutes.
+      try {
+        await this.deleteViewQuery(viewId, first.id);
+      } catch {
+        /* ignore */
+      }
+    }
+
+    return {
+      results: results.slice(0, maxResults),
+      incomplete,
+      truncatedLocally,
+      ...(typeof first.total_count === "number" ? { totalCount: first.total_count } : {}),
+    };
+  }
+
+  /** PATCH /v1/comments/{id} — GA 2026-04-17. */
+  updateComment(commentId: string, body: unknown): Promise<NotionCommentObject> {
+    return this.request<NotionCommentObject>(`/comments/${stripDashes(commentId)}`, {
+      method: "PATCH",
+      body,
+    });
+  }
+
+  /** DELETE /v1/comments/{id} — GA 2026-04-17. */
+  deleteComment(commentId: string): Promise<unknown> {
+    return this.request(`/comments/${stripDashes(commentId)}`, { method: "DELETE" });
+  }
+
+  /** POST /v1/data_sources/{id}/query — the 2025-09-03 successor to database query. */
+  queryDataSource(dataSourceId: string, body: unknown = {}): Promise<PaginatedList<NotionPageObject>> {
+    return this.request<PaginatedList<NotionPageObject>>(
+      `/data_sources/${stripDashes(dataSourceId)}/query`,
+      { method: "POST", body }
+    );
+  }
+
+  /**
+   * Page through a data source query, collecting rows.
+   *
+   * Same contract as queryViewAll(): truncation is always reported, never
+   * silent. Data source queries are the other endpoint Notion caps at 10,000
+   * results with a `request_status` of `incomplete`.
+   */
+  async queryDataSourceAll(
+    dataSourceId: string,
+    body: Record<string, unknown> = {},
+    opts: { maxResults?: number } = {}
+  ): Promise<CollectedPages<NotionPageObject>> {
+    const maxResults = opts.maxResults ?? 1000;
+    const results: NotionPageObject[] = [];
+    let incomplete: NotionRequestStatus | null = null;
+    let cursor: string | undefined;
+    let truncatedLocally = false;
+
+    do {
+      const page = await this.queryDataSource(dataSourceId, {
+        ...body,
+        ...(cursor !== undefined ? { start_cursor: cursor } : {}),
+      });
+      results.push(...page.results);
+      incomplete = incomplete ?? incompleteStatusOf(page);
+      cursor = page.has_more ? (page.next_cursor ?? undefined) : undefined;
+      if (cursor && results.length >= maxResults) {
+        truncatedLocally = true;
+        break;
+      }
+    } while (cursor);
+
+    return { results: results.slice(0, maxResults), incomplete, truncatedLocally };
+  }
+
+  /** GET /v1/custom_emojis — cursor-paginated, optional `name` filter. */
+  listCustomEmojis(
+    opts: { name?: string; startCursor?: string; pageSize?: number } = {}
+  ): Promise<PaginatedList<NotionCustomEmojiObject>> {
+    return this.request<PaginatedList<NotionCustomEmojiObject>>(`/custom_emojis`, {
+      query: {
+        name: opts.name,
+        start_cursor: opts.startCursor,
+        page_size: opts.pageSize,
+      },
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // File Upload API
+  //
+  // Three-step for the common case: create → send → attach. `single_part`
+  // (the default) covers everything up to 20MB, which is the only mode a
+  // Worker can realistically drive — see sendFileUpload().
+  // -------------------------------------------------------------------
+
+  /** POST /v1/file_uploads — reserve an upload slot. */
+  createFileUpload(body: {
+    mode?: "single_part" | "multi_part" | "external_url";
+    filename?: string;
+    content_type?: string;
+    number_of_parts?: number;
+    external_url?: string;
+  }): Promise<NotionFileUploadObject> {
+    return this.request<NotionFileUploadObject>(`/file_uploads`, { method: "POST", body });
+  }
+
+  /** GET /v1/file_uploads/{id} — poll status (`pending` → `uploaded`). */
+  getFileUpload(fileUploadId: string): Promise<NotionFileUploadObject> {
+    return this.request<NotionFileUploadObject>(`/file_uploads/${stripDashes(fileUploadId)}`);
+  }
+
+  /** GET /v1/file_uploads — list prior uploads. */
+  listFileUploads(
+    opts: { status?: string; startCursor?: string; pageSize?: number } = {}
+  ): Promise<PaginatedList<NotionFileUploadObject>> {
+    return this.request<PaginatedList<NotionFileUploadObject>>(`/file_uploads`, {
+      query: { status: opts.status, start_cursor: opts.startCursor, page_size: opts.pageSize },
+    });
+  }
+
+  /**
+   * POST /v1/file_uploads/{id}/send — push the bytes.
+   *
+   * Deliberately bypasses request(): this is the one endpoint that is NOT
+   * JSON. The body must be multipart/form-data, and critically we must NOT
+   * set content-type ourselves — the boundary parameter is generated by the
+   * FormData serializer and an explicit header would clobber it, which fails
+   * with an opaque 400.
+   *
+   * That also means this call sits outside the retry/refresh machinery in
+   * request(). A binary body is not safely replayable across a stream-backed
+   * FormData, so a failed send should be retried by re-driving the whole
+   * upload rather than the single request.
+   */
+  async sendFileUpload(
+    fileUploadId: string,
+    file: Blob,
+    opts: { filename?: string; partNumber?: number } = {}
+  ): Promise<NotionFileUploadObject> {
+    const form = new FormData();
+    if (opts.filename !== undefined) form.append("file", file, opts.filename);
+    else form.append("file", file);
+    if (opts.partNumber !== undefined) form.append("part_number", String(opts.partNumber));
+
+    const res = await this.fetchImpl(
+      `${NOTION_API}/file_uploads/${stripDashes(fileUploadId)}/send`,
+      {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.account.accessToken}`,
+          "notion-version": NOTION_VERSION,
+          // No content-type — FormData sets it, boundary included.
+        },
+        body: form,
+      }
+    );
+    if (!res.ok) {
+      const text = await res.text();
+      let parsed: { message?: string } | null = null;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        /* not json */
+      }
+      throw new Error(`Notion API ${res.status}: ${parsed?.message ?? text}`);
+    }
+    return (await res.json()) as NotionFileUploadObject;
+  }
+
+  /** POST /v1/file_uploads/{id}/complete — finalise a multi_part upload. */
+  completeFileUpload(fileUploadId: string): Promise<NotionFileUploadObject> {
+    return this.request<NotionFileUploadObject>(
+      `/file_uploads/${stripDashes(fileUploadId)}/complete`,
+      { method: "POST", body: {} }
+    );
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -375,6 +653,90 @@ export interface PaginatedList<T> {
   next_cursor: string | null;
   has_more: boolean;
   type?: string;
+  /** See NotionRequestStatus. Present on data-source and view query responses. */
+  request_status?: NotionRequestStatus;
+}
+
+/**
+ * Since 2026-04-20, data source and view queries stop paginating at 10,000
+ * results and say so in the response body:
+ *
+ *   { "request_status": { "type": "incomplete",
+ *                         "incomplete_reason": "query_result_limit_reached" } }
+ *
+ * The dangerous part is that `has_more` goes false at the same time, so a
+ * naive paginator sees a clean end-of-results and hands back a TRUNCATED set
+ * that looks complete. Every paginating helper in this file therefore reports
+ * the status rather than dropping it.
+ */
+export interface NotionRequestStatus {
+  type: "complete" | "incomplete";
+  /** e.g. "query_result_limit_reached". Left open — Notion may add reasons. */
+  incomplete_reason?: string;
+}
+
+/** Result of a paginating helper that may have been cut short. */
+export interface CollectedPages<T> {
+  results: T[];
+  /** Non-null when NOTION capped the result set. */
+  incomplete: NotionRequestStatus | null;
+  /** True when WE stopped early at the caller's maxResults. */
+  truncatedLocally: boolean;
+}
+
+/**
+ * Extract an `incomplete` request status from a response, or null if the
+ * response is complete / doesn't carry the field at all.
+ *
+ * Fails soft on unknown shapes: a response from an endpoint or API version
+ * that has never heard of `request_status` reads as complete, which is the
+ * pre-2026-04-20 behaviour.
+ */
+export function incompleteStatusOf(res: unknown): NotionRequestStatus | null {
+  if (!res || typeof res !== "object") return null;
+  const rs = (res as { request_status?: unknown }).request_status;
+  if (!rs || typeof rs !== "object") return null;
+  const type = (rs as { type?: unknown }).type;
+  if (type !== "incomplete") return null;
+  const reason = (rs as { incomplete_reason?: unknown }).incomplete_reason;
+  return {
+    type: "incomplete",
+    ...(typeof reason === "string" ? { incomplete_reason: reason } : {}),
+  };
+}
+
+/**
+ * Human-readable warning for a truncated result set. Tools append this to
+ * their output so the caller sees the truncation instead of silently
+ * reasoning over a partial answer.
+ */
+export function describeTruncation(collected: {
+  incomplete: NotionRequestStatus | null;
+  truncatedLocally: boolean;
+  results: unknown[];
+}): string | null {
+  if (collected.incomplete) {
+    const reason = collected.incomplete.incomplete_reason;
+    if (reason === "query_result_limit_reached") {
+      return (
+        `⚠️ INCOMPLETE RESULTS — Notion capped this query at its 10,000-result pagination limit ` +
+        `(request_status: incomplete, ${reason}). ${collected.results.length} row(s) returned. ` +
+        `Narrow the filter to see the rest; do not treat this as the full set.`
+      );
+    }
+    return (
+      `⚠️ INCOMPLETE RESULTS — Notion returned request_status: incomplete` +
+      `${reason ? ` (${reason})` : ""}. ${collected.results.length} row(s) returned; ` +
+      `this is not the full set.`
+    );
+  }
+  if (collected.truncatedLocally) {
+    return (
+      `⚠️ TRUNCATED — stopped after ${collected.results.length} row(s) at this tool's per-call cap. ` +
+      `More rows exist. Narrow the filter or raise \`max_results\`.`
+    );
+  }
+  return null;
 }
 
 export interface NotionPageObject {
@@ -469,6 +831,41 @@ export interface NotionViewObject {
   configuration?: Record<string, unknown> | null;
 }
 
+/** POST /v1/views/{id}/queries response. `id` is the query id to page with. */
+export interface NotionViewQueryObject {
+  object: "view_query";
+  id: string;
+  view_id: string;
+  /** ISO timestamp — the cached result set is dropped 15 minutes after creation. */
+  expires_at?: string;
+  total_count?: number;
+  results: Array<{ object: "page"; id: string }>;
+  next_cursor: string | null;
+  has_more: boolean;
+  request_status?: NotionRequestStatus;
+}
+
+/** GET /v1/custom_emojis result item. */
+export interface NotionCustomEmojiObject {
+  object: "custom_emoji";
+  id: string;
+  name: string;
+  url: string;
+}
+
+/** File Upload object — POST/GET /v1/file_uploads. */
+export interface NotionFileUploadObject {
+  object: "file_upload";
+  id: string;
+  status: "pending" | "uploaded" | "expired" | "failed";
+  filename?: string | null;
+  content_type?: string | null;
+  content_length?: number | null;
+  upload_url?: string;
+  complete_url?: string;
+  expiry_time?: string | null;
+}
+
 export interface NotionUserObject {
   object: "user";
   id: string;
@@ -507,11 +904,26 @@ export type NotionRichText = {
   equation?: { expression: string };
 };
 
+/**
+ * Colours Notion accepts on a native `icon`. Defaults to "gray" when omitted.
+ * Note "lightgray" is one word — not "light_gray".
+ */
+export const NATIVE_ICON_COLORS = [
+  "gray", "lightgray", "brown", "yellow", "orange",
+  "green", "blue", "purple", "pink", "red",
+] as const;
+export type NativeIconColor = (typeof NATIVE_ICON_COLORS)[number];
+
 export type NotionIcon =
   | { type: "emoji"; emoji: string }
   | { type: "external"; external: { url: string } }
   | { type: "file"; file: { url: string; expiry_time?: string } }
-  | { type: "custom_emoji"; custom_emoji: { id: string; name: string; url: string } };
+  // Custom emoji: responses carry id + name + url, but a WRITE only needs id.
+  // Both halves are optional here so the same type covers read and write.
+  | { type: "custom_emoji"; custom_emoji: { id?: string; name?: string; url?: string } }
+  // Native Notion icon (2026-03-25). Since 2026-07-01 `name` also accepts the
+  // icon-picker labels shown in the UI ("star circle"), not just API names.
+  | { type: "icon"; icon: { name: string; color?: NativeIconColor | string } };
 
 export type NotionCover =
   | { type: "external"; external: { url: string } }

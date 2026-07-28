@@ -75,6 +75,11 @@ const KEYWORDS = new Set<string>([
   "PAGE_COVER", "PAGE_CONTENT",
   // Booleans
   "TRUE", "FALSE",
+  // Relative date values (2026-03-30) — bare keywords on date filters.
+  "TODAY", "TOMORROW", "YESTERDAY", "ONE_WEEK_AGO", "ONE_WEEK_FROM_NOW",
+  "ONE_MONTH_AGO", "ONE_MONTH_FROM_NOW",
+  // The current-user token for people filters (2026-03-30).
+  "ME",
   // Filter: NOT EMPTY etc. already covered by NOT + EMPTY tokens.
 ]);
 

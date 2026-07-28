@@ -26,7 +26,7 @@ import {
   type NotionPageObject,
   type NotionRichText,
 } from "../notion/client";
-import { stripResponseOnlyNulls } from "./update-page/shared";
+import { sanitizeIconForWrite, stripResponseOnlyNulls } from "./update-page/shared";
 
 const CHILDREN_PER_REQUEST = 100;
 
@@ -132,7 +132,13 @@ async function duplicatePageHandler(args: Record<string, unknown>, ctx: ToolCont
       properties,
       children: firstBatch,
     };
-    if (source.icon) body.icon = source.icon;
+    // sanitizeIconForWrite strips response-only fields that the write schema
+    // rejects — notably custom_emoji's `name`/`url` and a native icon's
+    // presentation extras. It returns undefined (never null) when there's no
+    // icon, so this stays a plain truthiness check: assigning `icon: null`
+    // here is what caused the duplicate_page null-icon bug.
+    const clonedIcon = sanitizeIconForWrite(source.icon);
+    if (clonedIcon) body.icon = clonedIcon;
     if (source.cover) body.cover = source.cover;
     created = await client.createPage(body);
 

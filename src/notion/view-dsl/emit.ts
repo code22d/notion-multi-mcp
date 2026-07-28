@@ -309,7 +309,13 @@ function inferFilterType(op: FilterOperator, v?: FilterValue): FilterPropertyTyp
   if (op === "less_than" || op === "greater_than" || op === "less_than_or_equal_to" || op === "greater_than_or_equal_to") {
     return "number";
   }
-  if (op === "in") return "multi_select";
+  if (op === "in" || op === "not_in") return "multi_select";
+  // A relative-date or ME value pins the type on its own, regardless of
+  // operator — `= TODAY` can only mean a date column, `CONTAINS ME` a people
+  // column. Checked before the number/boolean shortcuts so `= TODAY` doesn't
+  // fall through to the rich_text default.
+  if (v?.kind === "relative_date") return "date";
+  if (v?.kind === "me") return "people";
   if (v?.kind === "number") return "number";
   if (v?.kind === "boolean") return "checkbox";
   // equals/does_not_equal/contains/starts_with/ends_with/is_empty/is_not_empty
@@ -349,7 +355,7 @@ function emitFilterCondition(
     case "people":
     case "files":
     case "relation":
-      return relationCondition(op, v);
+      return relationCondition(type, op, v);
     case "formula":
       throw new EmitError(
         "FORMULA filters need the inner result type — write the filter against the underlying property instead."
@@ -365,7 +371,27 @@ function requireString(v: FilterValue | undefined, label: string): string {
   if (!v) throw new EmitError(`${label} requires a value`);
   if (v.kind === "string") return v.value;
   if (v.kind === "number") return String(v.value);
-  throw new EmitError(`${label} requires a string value, got ${v.kind}`);
+  // Name the misuse rather than reporting an internal kind. `"Name" = TODAY`
+  // is a plausible thing to write, and "requires a string value, got
+  // relative_date" doesn't tell the author what to do instead.
+  if (v.kind === "relative_date") {
+    throw new EmitError(
+      `${label}: ${v.value.toUpperCase()} is a relative-date value and is only valid on DATE properties. ` +
+        `Quote it ('${v.value}') if you really meant the literal text.`
+    );
+  }
+  if (v.kind === "me") {
+    throw new EmitError(
+      `${label}: ME is only valid on PEOPLE properties with CONTAINS / does-not-contain. ` +
+        `Quote it ('me') if you really meant the literal text.`
+    );
+  }
+  if (v.kind === "list") {
+    throw new EmitError(
+      `${label} takes a single value — use IN (…) or NOT IN (…) for a multi-value match.`
+    );
+  }
+  throw new EmitError(`${label} requires a string value, got ${(v as { kind: string }).kind}`);
 }
 
 function requireNumber(v: FilterValue | undefined, label: string): number {
@@ -406,31 +432,38 @@ function numberCondition(op: FilterOperator, v?: FilterValue): Record<string, un
   }
 }
 
+/**
+ * select / status.
+ *
+ * Since 2026-04-17 `equals` and `does_not_equal` accept an ARRAY as well as a
+ * single value, which is what `IN` / `NOT IN` emit. The single-value forms are
+ * untouched, so existing DSL keeps producing byte-identical filters.
+ */
 function selectCondition(op: FilterOperator, v?: FilterValue): Record<string, unknown> {
   switch (op) {
     case "equals":         return { equals: requireString(v, "= on select/status") };
     case "does_not_equal": return { does_not_equal: requireString(v, "!= on select/status") };
-    case "in": {
-      if (!v || v.kind !== "list") throw new EmitError("IN requires a list value");
-      return { equals: v.values.map(String) };
-    }
+    case "in":             return { equals: requireList(v, "IN") };
+    case "not_in":         return { does_not_equal: requireList(v, "NOT IN") };
     default:
       throw new EmitError(`operator "${op}" is not supported on select/status properties`);
   }
 }
 
+/**
+ * multi_select.
+ *
+ * Since 2026-04-17 `contains` and `does_not_contain` accept an ARRAY. The
+ * previous comment here hedged that arrays "should" work on 2025-09-03; the
+ * changelog now states it outright, and `NOT IN` gets the matching
+ * `does_not_contain` array form.
+ */
 function multiSelectCondition(op: FilterOperator, v?: FilterValue): Record<string, unknown> {
   switch (op) {
     case "contains":         return { contains: requireString(v, "CONTAINS on multi_select") };
     case "does_not_contain": return { does_not_contain: requireString(v, "does not contain on multi_select") };
-    case "in": {
-      if (!v || v.kind !== "list") throw new EmitError("IN requires a list value");
-      // multi_select doesn't natively take an array — emit as compound OR of
-      // single `contains` filters. But since filters live under a property
-      // object, we can't easily wrap here. Instead, pass the array through as
-      // `contains: [...]` — Notion's 2025-09-03 API accepts an array form.
-      return { contains: v.values.map(String) };
-    }
+    case "in":               return { contains: requireList(v, "IN") };
+    case "not_in":           return { does_not_contain: requireList(v, "NOT IN") };
     default:
       throw new EmitError(`operator "${op}" is not supported on multi_select properties`);
   }
@@ -445,25 +478,85 @@ function checkboxCondition(op: FilterOperator, v?: FilterValue): Record<string, 
   }
 }
 
+/**
+ * date.
+ *
+ * `equals`, `before`, `after`, `on_or_before` and `on_or_after` accept either
+ * an ISO-8601 string or one of the relative keywords Notion added on
+ * 2026-03-30 (TODAY, ONE_WEEK_FROM_NOW, …). The relative values are resolved
+ * SERVER-side against the workspace's timezone, so we pass the token straight
+ * through rather than computing a date here — computing it in the Worker would
+ * bake in UTC and drift from what the user sees in the Notion UI.
+ */
 function dateCondition(op: FilterOperator, v?: FilterValue): Record<string, unknown> {
   switch (op) {
-    case "equals":        return { equals: requireString(v, "= on date") };
-    case "before":        return { before: requireString(v, "BEFORE") };
-    case "after":         return { after: requireString(v, "AFTER") };
-    case "on_or_before":  return { on_or_before: requireString(v, "ON OR BEFORE") };
-    case "on_or_after":   return { on_or_after: requireString(v, "ON OR AFTER") };
+    case "equals":        return { equals: requireDateValue(v, "= on date") };
+    case "before":        return { before: requireDateValue(v, "BEFORE") };
+    case "after":         return { after: requireDateValue(v, "AFTER") };
+    case "on_or_before":  return { on_or_before: requireDateValue(v, "ON OR BEFORE") };
+    case "on_or_after":   return { on_or_after: requireDateValue(v, "ON OR AFTER") };
     default:
       throw new EmitError(`operator "${op}" is not supported on date properties`);
   }
 }
 
-function relationCondition(op: FilterOperator, v?: FilterValue): Record<string, unknown> {
+/**
+ * people / files / relation.
+ *
+ * `ME` (2026-03-30) is accepted only on PEOPLE columns — it is a user token,
+ * meaningless as a relation row id or a filename, and Notion would reject it
+ * there with a less helpful message than this one.
+ *
+ * Caveat worth knowing at the call site: "me" resolves to the authorizing user
+ * only for PUBLIC integrations. An internal integration has no authorizing
+ * user, so Notion matches nothing and the filter silently returns zero rows.
+ * This connector is a public OAuth integration, so the token does resolve —
+ * but a DSL copied into an internal integration will behave differently.
+ */
+function relationCondition(
+  type: FilterPropertyType,
+  op: FilterOperator,
+  v?: FilterValue
+): Record<string, unknown> {
+  if (v?.kind === "me" && type !== "people") {
+    throw new EmitError(
+      `ME is only valid on people properties (got a ${type} property). ` +
+        `For relation columns, filter on the related page's id instead.`
+    );
+  }
   switch (op) {
-    case "contains":         return { contains: requireString(v, "CONTAINS on relation/people") };
-    case "does_not_contain": return { does_not_contain: requireString(v, "does not contain") };
+    case "contains":         return { contains: requirePersonValue(v, "CONTAINS on relation/people") };
+    case "does_not_contain": return { does_not_contain: requirePersonValue(v, "does not contain") };
     default:
       throw new EmitError(`operator "${op}" is not supported on people/relation properties`);
   }
+}
+
+/** A date operand: an ISO string, or one of Notion's relative-date tokens. */
+function requireDateValue(v: FilterValue | undefined, label: string): string {
+  if (v?.kind === "relative_date") return v.value;
+  if (v?.kind === "me") {
+    throw new EmitError(`${label}: ME is a people-filter value and cannot be used on a date property`);
+  }
+  return requireString(v, label);
+}
+
+/** A people/relation operand: an id string, or the `me` token. */
+function requirePersonValue(v: FilterValue | undefined, label: string): string {
+  if (v?.kind === "me") return "me";
+  if (v?.kind === "relative_date") {
+    throw new EmitError(
+      `${label}: ${v.value.toUpperCase()} is a relative-date value and cannot be used on a people/relation property`
+    );
+  }
+  return requireString(v, label);
+}
+
+/** A multi-value operand for IN / NOT IN. */
+function requireList(v: FilterValue | undefined, label: string): string[] {
+  if (!v || v.kind !== "list") throw new EmitError(`${label} requires a parenthesised list, e.g. ${label} ("a", "b")`);
+  if (v.values.length === 0) throw new EmitError(`${label} requires at least one value`);
+  return v.values.map(String);
 }
 
 // -----------------------------------------------------------------------------

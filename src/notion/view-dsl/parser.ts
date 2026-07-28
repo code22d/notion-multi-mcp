@@ -26,7 +26,9 @@ import type {
   FormAst,
   CoverAst,
   GroupByPropertyType,
+  RelativeDateValue,
 } from "./ast";
+import { RELATIVE_DATE_VALUES } from "./ast";
 import { LexError, tokenize, type Token } from "./lexer";
 
 export class ParseError extends Error {
@@ -366,23 +368,47 @@ function parseOperatorAndValue(
     }
     case "IN": {
       p.advance();
-      p.consume("LPAREN", "(");
-      const values: Array<string | number> = [];
-      while (true) {
-        const startTok = p.peek();
-        const v = parseAtomValue(p);
-        if (v.kind === "string") values.push(v.value);
-        else if (v.kind === "number") values.push(v.value);
-        else throw new ParseError(`IN list items must be strings or numbers`, startTok.line, startTok.col);
-        if (p.accept("COMMA")) continue;
-        break;
+      return { operator: "in", value: parseInList(p, "IN") };
+    }
+    case "NOT": {
+      // NOT IN ("a", "b") — the multi-value exclusion form. Notion's select /
+      // status `does_not_equal` and multi_select `does_not_contain` accept
+      // arrays as of 2026-04-17; this is the DSL spelling for that.
+      //
+      // `NOT` is otherwise only reachable via `IS NOT EMPTY`, which is handled
+      // inside the IS branch above, so there's no ambiguity here.
+      p.advance();
+      const inTok = p.peek();
+      if (inTok.kind !== "KEYWORD" || inTok.value !== "IN") {
+        throw new ParseError(
+          `expected IN after NOT (did you mean "IS NOT EMPTY"?), got ${tokDesc(inTok)}`,
+          inTok.line,
+          inTok.col
+        );
       }
-      p.consume("RPAREN", ")");
-      return { operator: "in", value: { kind: "list", values } };
+      p.advance();
+      return { operator: "not_in", value: parseInList(p, "NOT IN") };
     }
     default:
       throw new ParseError(`unknown filter operator "${t.value}"`, t.line, t.col);
   }
+}
+
+/** Shared list body for `IN (...)` / `NOT IN (...)`. */
+function parseInList(p: Cursor, label: string): FilterValue {
+  p.consume("LPAREN", "(");
+  const values: Array<string | number> = [];
+  while (true) {
+    const startTok = p.peek();
+    const v = parseAtomValue(p);
+    if (v.kind === "string") values.push(v.value);
+    else if (v.kind === "number") values.push(v.value);
+    else throw new ParseError(`${label} list items must be strings or numbers`, startTok.line, startTok.col);
+    if (p.accept("COMMA")) continue;
+    break;
+  }
+  p.consume("RPAREN", ")");
+  return { kind: "list", values };
 }
 
 function parseAtomValue(p: Cursor): FilterValue {
@@ -405,8 +431,28 @@ function parseAtomValue(p: Cursor): FilterValue {
     p.advance();
     return { kind: "boolean", value: t.value === "TRUE" };
   }
-  throw new ParseError(`expected a value (string, number, or boolean), got ${tokDesc(t)}`, t.line, t.col);
+  // Relative date keywords (2026-03-30): TODAY, ONE_WEEK_FROM_NOW, …
+  // Carried as their own FilterValue kind so the emitter can reject them on
+  // non-date columns rather than emitting a literal text match.
+  if (t.kind === "KEYWORD" && RELATIVE_DATE_KEYWORDS.has(t.value)) {
+    p.advance();
+    return { kind: "relative_date", value: t.value.toLowerCase() as RelativeDateValue };
+  }
+  // The `me` people-filter token (2026-03-30).
+  if (t.kind === "KEYWORD" && t.value === "ME") {
+    p.advance();
+    return { kind: "me" };
+  }
+  throw new ParseError(
+    `expected a value (string, number, boolean, a relative date like TODAY, or ME), got ${tokDesc(t)}`,
+    t.line,
+    t.col
+  );
 }
+
+const RELATIVE_DATE_KEYWORDS: ReadonlySet<string> = new Set(
+  RELATIVE_DATE_VALUES.map((v) => v.toUpperCase())
+);
 
 // -----------------------------------------------------------------------------
 // SORT BY
