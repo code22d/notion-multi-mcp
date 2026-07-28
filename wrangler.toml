@@ -21,6 +21,13 @@
 
 name = "notion-multi-mcp"
 main = "src/index.ts"
+# Pinned deliberately: this worker also exists in a second Cloudflare account.
+# Without account_id, wrangler picks for you based on whichever login is
+# active, and a wrong-account deploy would stand up a duplicate worker on a
+# different workers.dev subdomain whose KV binding points at a namespace that
+# doesn't exist there — every stored OAuth token would silently be missing.
+# 1ca89091… = "Info@reneceo.com's Account" (owns KV 8101642dc8ff4d33aa209b4e3f662143).
+account_id = "1ca89091477fe859962f0e9a14e8942e"
 compatibility_date = "2025-04-18"
 compatibility_flags = ["nodejs_compat"]
 
