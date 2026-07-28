@@ -3,7 +3,12 @@
 //
 // Accepts the same `id` forms the native MCP accepts:
 //   - Raw UUIDs (with or without dashes)
-//   - notion.so URLs
+//   - app.notion.com/p/{id} URLs — Notion moved its app links to this domain
+//     in early June 2026 (changelog 2026-07-15). The parser below is
+//     domain-agnostic (it pulls the trailing hex id out of the last path
+//     segment), so this worked before the domain change and still does; only
+//     the tool DESCRIPTION was stale, and that's now fixed.
+//   - Legacy notion.so URLs
 //   - *.notion.site URLs
 //   - collection:// URIs for data sources
 //
@@ -22,7 +27,9 @@ export function registerFetchTool(register: (def: ToolDef) => void): void {
   register({
     name: "notion_fetch",
     description:
-      "Fetch a Notion page, database, or data source by URL or ID on the specified account. Returns a summary plus full JSON. Supports notion.so URLs, *.notion.site URLs, raw UUIDs, collection:// data-source URIs, and discussion:// URIs.",
+      "Fetch a Notion page, database, or data source by URL or ID on the specified account. Returns a summary plus full JSON. " +
+      "Accepts app.notion.com/p/{id} URLs (Notion's current app-link domain since June 2026), legacy notion.so URLs, " +
+      "*.notion.site URLs, raw UUIDs with or without dashes, collection:// data-source URIs, and discussion:// URIs.",
     inputSchema: {
       type: "object",
       properties: {

@@ -230,7 +230,7 @@ function renderBlock(block: HydratedBlock, ctx: Ctx): string | null {
         (content?.rich_text as NotionRichText[] | undefined) ?? []
       )} -->`;
     case "tab":
-      return `${ctx.indent}<!-- notion:tab -->`;
+      return renderTabs(block, ctx);
     case "meeting_notes":
     case "transcription":
       return `${ctx.indent}<!-- notion:${type} -->`;
@@ -395,6 +395,100 @@ function renderTable(block: HydratedBlock, ctx: Ctx): string {
 function renderTableRow(content: Record<string, unknown> | undefined, ctx: Ctx): string {
   const cells = ((content?.cells as NotionRichText[][] | undefined) ?? []).map((c) => richTextToMarkdown(c));
   return `${ctx.indent}| ${cells.map(cellEscape).join(" | ")} |`;
+}
+
+/**
+ * Tab blocks (Notion 2026-03-25).
+ *
+ * The block itself is `{ type: "tab", tab: {} }` — everything lives in its
+ * children, and only PARAGRAPHS may be direct children. Each such paragraph is
+ * one tab: its `rich_text` is the tab's label, its optional `icon` the tab's
+ * icon, and its `children` the tab's actual content.
+ *
+ * Markdown representation — `<tabs>` wrapping `<tab><summary>label</summary>`:
+ *
+ *   <tabs>
+ *     <tab icon="📋"><summary>Overview</summary>
+ *       Content of the first tab.
+ *     </tab>
+ *     <tab><summary>Details</summary>
+ *       Content of the second tab.
+ *     </tab>
+ *   </tabs>
+ *
+ * Chosen over the obvious `<tab label="Overview">` because the label is
+ * RICH TEXT, and an HTML attribute can only carry a flattened string —
+ * a bold or linked tab label would be silently destroyed on every read. The
+ * `<summary>` child is exactly how this file already renders a toggle's
+ * rich-text label, so the same escaping and round-trip path applies, and
+ * `<tabs>`/`<tab>` matches the existing `<column-list>`/`<column>` pairing.
+ * The icon has no rich text to lose, so it stays an attribute.
+ */
+function renderTabs(block: HydratedBlock, ctx: Ctx): string {
+  const children = block.children ?? [];
+  const inner = ctx.indent + "  ";
+  const parts: string[] = [`${ctx.indent}<tabs>`];
+
+  for (const child of children) {
+    // Defensive: Notion says only paragraphs can be direct children, but a
+    // future block type here must not vanish from the output.
+    if (child.type !== "paragraph") {
+      const rendered = renderBlock(child, { indent: inner, listCounters: new Map() });
+      if (rendered !== null) parts.push(rendered);
+      continue;
+    }
+    const body = (child as unknown as Record<string, unknown>).paragraph as
+      | Record<string, unknown>
+      | undefined;
+    const label = richTextToMarkdown((body?.rich_text as NotionRichText[] | undefined) ?? []);
+    const iconAttr = tabIconAttribute(body?.icon);
+    const content = renderChildren(child, { indent: inner, listCounters: new Map() });
+    parts.push(`${inner}<tab${iconAttr}><summary>${label}</summary>`);
+    if (content) parts.push(content);
+    parts.push(`${inner}</tab>`);
+  }
+
+  parts.push(`${ctx.indent}</tabs>`);
+  return parts.join("\n");
+}
+
+/**
+ * Render a tab's icon as an ` icon="…"` attribute, or "" when there is none.
+ *
+ * Mirrors the input spellings normalizeIconInput() accepts, so a tab read out
+ * and written back keeps its icon:
+ *   emoji        → icon="📋"
+ *   native icon  → icon="icon:pizza" / icon="icon:pizza:blue"
+ *   custom emoji → icon="custom_emoji:<id>"
+ *   external     → icon="https://…"
+ */
+function tabIconAttribute(raw: unknown): string {
+  if (!raw || typeof raw !== "object") return "";
+  const icon = raw as Record<string, unknown>;
+  const type = typeof icon.type === "string" ? icon.type : undefined;
+
+  let value: string | undefined;
+  if (type === "emoji" && typeof icon.emoji === "string") {
+    value = icon.emoji;
+  } else if (type === "icon") {
+    const nat = icon.icon as Record<string, unknown> | undefined;
+    if (nat && typeof nat.name === "string") {
+      value = typeof nat.color === "string" ? `icon:${nat.name}:${nat.color}` : `icon:${nat.name}`;
+    }
+  } else if (type === "custom_emoji") {
+    const ce = icon.custom_emoji as Record<string, unknown> | undefined;
+    if (ce && typeof ce.id === "string") value = `custom_emoji:${ce.id}`;
+    else if (ce && typeof ce.name === "string") value = `:${ce.name}:`;
+  } else if (type === "external") {
+    const ext = icon.external as Record<string, unknown> | undefined;
+    if (ext && typeof ext.url === "string") value = ext.url;
+  } else if (type === "file") {
+    const f = icon.file as Record<string, unknown> | undefined;
+    if (f && typeof f.url === "string") value = f.url;
+  }
+
+  if (!value) return "";
+  return ` icon="${value.replace(/"/g, "&quot;")}"`;
 }
 
 function renderColumnList(block: HydratedBlock, ctx: Ctx): string {

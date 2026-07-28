@@ -53,13 +53,20 @@ export async function updatePropertiesHandler(
     resolveType = await resolveTypesForPage(client, pageId);
   }
 
-  const { notionProps, archived, inTrash, error } = normaliseProperties(propsRaw, resolveType);
+  const { notionProps, archived, inTrash, isLocked, error } = normaliseProperties(propsRaw, resolveType);
   if (error) return textErr(error);
   if (notionProps && Object.keys(notionProps).length > 0) {
     body.properties = notionProps;
   }
+  // TODO(2026-03-11): `archived` is REMOVED in API version 2026-03-11 —
+  // `in_trash` is its replacement and both are sent today. On 2025-09-03 (what
+  // src/notion/client.ts pins) `archived` still works, and sending both is
+  // what the field has been running, so the behaviour is left intact. When the
+  // version is bumped, delete this line and the `archived` plumbing in
+  // normaliseProperties() below, keeping `in_trash` only.
   if (archived !== undefined) body.archived = archived;
   if (inTrash !== undefined) body.in_trash = inTrash;
+  if (isLocked !== undefined) body.is_locked = isLocked;
 
   const icon = normalizeIconInput(args.icon);
   if (icon !== undefined) body.icon = icon;
@@ -78,6 +85,7 @@ export async function updatePropertiesHandler(
   if (body.icon !== undefined) touched.push(body.icon === null ? "icon removed" : "icon set");
   if (body.archived !== undefined) touched.push(body.archived ? "archived" : "unarchived");
   if (body.in_trash !== undefined) touched.push(body.in_trash ? "moved to trash" : "restored from trash");
+  if (body.is_locked !== undefined) touched.push(body.is_locked ? "locked" : "unlocked");
   return textOk(`Updated page ${pageId} — ${touched.join(", ")}.`);
 }
 
@@ -85,6 +93,8 @@ export interface NormalisedProps {
   notionProps: Record<string, unknown>;
   archived?: boolean;
   inTrash?: boolean;
+  /** PATCH /v1/pages `is_locked` — lock the page against edits in the UI. */
+  isLocked?: boolean;
   error?: string;
 }
 
@@ -149,6 +159,7 @@ export function normaliseProperties(
   const out: Record<string, unknown> = {};
   let archived: boolean | undefined;
   let inTrash: boolean | undefined;
+  let isLocked: boolean | undefined;
 
   for (const [rawKey, value] of Object.entries(simple)) {
     // Unwrap `userDefined:` prefix used to escape id/url property-name collisions.
@@ -164,6 +175,15 @@ export function normaliseProperties(
     if (key === "in_trash") {
       if (typeof value === "boolean") inTrash = value;
       else inTrash = value === "__YES__" || value === 1;
+      continue;
+    }
+    // `is_locked` (page lock) is on PATCH /v1/pages' body whitelist, alongside
+    // archived / in_trash, so it belongs here rather than in `properties`.
+    // Same __YES__/__NO__ sentinel handling as the other two for consistency
+    // with the flat property-map format the native MCP uses.
+    if (key === "is_locked") {
+      if (typeof value === "boolean") isLocked = value;
+      else isLocked = value === "__YES__" || value === 1;
       continue;
     }
 
@@ -221,5 +241,5 @@ export function normaliseProperties(
     };
   }
 
-  return { notionProps: out, archived, inTrash };
+  return { notionProps: out, archived, inTrash, isLocked };
 }

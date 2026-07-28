@@ -13,6 +13,7 @@
 
 import { Marked, type Token, type Tokens, type TokensList } from "marked";
 import { tokensToRichText, type RichTextRun } from "./to-rich-text";
+import { normalizeIconInput } from "../icons";
 
 // Use a fresh Marked instance so we don't pollute any global config elsewhere.
 // GFM is on by default in marked v18 but we set it explicitly for clarity.
@@ -413,6 +414,44 @@ function tryHtmlBlock(raw: string): BlockRequest[] | null {
     const body: Record<string, unknown> = { rich_text: toRichText(summaryTokens) };
     if (bodyMd) body.children = markdownToBlocks(bodyMd);
     return [{ type: "toggle", toggle: body }];
+  }
+
+  // Undo the minimal attribute escaping tabIconAttribute() applies on the way
+  // out, so an icon containing a quote round-trips.
+  const decodeHtmlAttr = (s: string): string =>
+    s.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
+
+  // <tabs>…</tabs> → tab block (Notion 2026-03-25).
+  //
+  // A tab block's direct children must all be PARAGRAPHS: the paragraph's
+  // rich_text is the tab label, its optional `icon` the tab icon, and its
+  // `children` the tab's content. So each <tab> here becomes one paragraph,
+  // NOT a block of its own — getting that inverted produces a 400 that reads
+  // like an unrelated schema error.
+  const tabsMatch = trimmed.match(/^<tabs>\s*([\s\S]*?)\s*<\/tabs>\s*$/i);
+  if (tabsMatch) {
+    const inside = tabsMatch[1] ?? "";
+    const tabRe = /<tab(\s[^>]*)?>\s*<summary>([\s\S]*?)<\/summary>\s*([\s\S]*?)\s*<\/tab>/gi;
+    const tabs: BlockRequest[] = [];
+    let tm: RegExpExecArray | null;
+    while ((tm = tabRe.exec(inside))) {
+      const attrs = tm[1] ?? "";
+      const labelMd = tm[2] ?? "";
+      const bodyMd = (tm[3] ?? "").trim();
+      const labelTokens = mdLexer.lexer(labelMd).flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
+      const paragraph: Record<string, unknown> = { rich_text: toRichText(labelTokens) };
+      const iconRaw = /\bicon="([^"]*)"/i.exec(attrs)?.[1];
+      if (iconRaw) {
+        const icon = normalizeIconInput(decodeHtmlAttr(iconRaw));
+        // normalizeIconInput returns null for ""/"none"; a tab with no icon
+        // should simply omit the key rather than send an explicit null.
+        if (icon) paragraph.icon = icon;
+      }
+      if (bodyMd) paragraph.children = markdownToBlocks(bodyMd);
+      tabs.push({ type: "paragraph", paragraph });
+    }
+    if (tabs.length === 0) return null;
+    return [{ type: "tab", tab: { children: tabs } }];
   }
 
   // <column-list>…</column-list> → column_list with nested columns

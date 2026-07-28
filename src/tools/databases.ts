@@ -19,9 +19,18 @@
 
 import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../accounts/resolver";
-import { stripDashes, type NotionDatabaseObject, type NotionDataSourceObject } from "../notion/client";
+import {
+  describeTruncation,
+  stripDashes,
+  type NotionDatabaseObject,
+  type NotionDataSourceObject,
+} from "../notion/client";
 import { parseCreateTable, parseAlterStatements, ParseError } from "../notion/ddl/parser";
 import { emitCreateProperties, emitAlterPatch, plainTextToRichText, EmitError } from "../notion/ddl/emit";
+// notion_query_data_source reuses the View DSL for filters/sorts — the shapes
+// are identical, so a second dialect would only be a way for them to diverge.
+import { parseViewDsl, ParseError as ViewParseError } from "../notion/view-dsl/parser";
+import { emitViewBody, EmitError as ViewEmitError } from "../notion/view-dsl/emit";
 
 export function registerDatabaseTools(register: (def: ToolDef) => void): void {
   register({
@@ -77,12 +86,154 @@ export function registerDatabaseTools(register: (def: ToolDef) => void): void {
         },
         in_trash: { type: "boolean", description: "Move the data source to / out of the trash." },
         is_inline: { type: "boolean", description: "Toggle inline rendering on the parent database." },
+        is_locked: {
+          type: "boolean",
+          description:
+            "Lock / unlock the parent DATABASE against edits in the Notion UI. Applied to the database object, not the data source.",
+        },
       },
       required: ["account", "data_source_id"],
       additionalProperties: false,
     },
     handler: updateDataSourceHandler,
   });
+
+  register({
+    name: "notion_query_data_source",
+    description:
+      "Query the rows of a Notion data source (a database's table of pages), with optional filters and sorts. " +
+      "`filter` uses the same FILTER / SORT BY directive grammar as notion_create_view — Notion's data-source query and " +
+      "view filter shapes are identical, so one dialect covers both. Example: " +
+      'FILTER "Status" IN ("To-do", "In progress"); SORT BY "Due" ASC. ' +
+      "Set `is_archived: true` to query ARCHIVED rows instead of live ones (Notion 2026-07-15). " +
+      "Notion caps any query at 10,000 results; if that cap is hit the response says so explicitly rather than " +
+      "quietly returning a truncated set.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...ACCOUNT_PARAM_SCHEMA,
+        data_source_id: { type: "string", description: "The data source id (or a collection:// URI)." },
+        filter: {
+          type: "string",
+          description:
+            'FILTER / SORT BY directives, e.g. FILTER "Status" = "Done"; SORT BY "Created" DESC. ' +
+            "Supports multi-value IN / NOT IN, relative dates (TODAY, ONE_WEEK_AGO, …), and ME on people columns.",
+        },
+        is_archived: {
+          type: "boolean",
+          description: "Return ARCHIVED rows instead of live ones. Default false.",
+        },
+        max_results: {
+          type: "integer",
+          minimum: 1,
+          description: "Stop after this many rows (default 100). Truncation is always reported.",
+        },
+      },
+      required: ["account", "data_source_id"],
+      additionalProperties: false,
+    },
+    handler: queryDataSourceHandler,
+  });
+}
+
+// -----------------------------------------------------------------------------
+// notion_query_data_source
+// -----------------------------------------------------------------------------
+
+async function queryDataSourceHandler(args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
+  const account = await resolveAccount(args, ctx);
+  const client = createNotionClient(account, ctx);
+
+  const raw = typeof args.data_source_id === "string" ? args.data_source_id.trim() : "";
+  if (!raw) return textErr("`data_source_id` is required.");
+  const dsId = stripDashes(raw.startsWith("collection://") ? raw.slice("collection://".length) : raw);
+
+  const body: Record<string, unknown> = {};
+
+  // Reuse the View DSL for filters and sorts. The two shapes really are the
+  // same — a view's `filter`/`sorts` and a data-source query's are the same
+  // JSON — so maintaining a second dialect here would only create a way for
+  // them to disagree.
+  const dsl = typeof args.filter === "string" ? args.filter.trim() : "";
+  if (dsl) {
+    try {
+      const directives = parseViewDsl(dsl);
+      const unsupported = directives.find((d) => d.kind !== "filter" && d.kind !== "sort");
+      if (unsupported) {
+        return textErr(
+          `notion_query_data_source only accepts FILTER and SORT BY directives — ` +
+            `layout directives like ${unsupported.kind.toUpperCase().replace("_", " ")} belong on a view. ` +
+            `Use notion_create_view / notion_update_view for those.`
+        );
+      }
+      // Resolve column types from the schema so a FILTER on a select/status
+      // column emits the right condition shape. Same fail-soft contract as the
+      // view tools: an unknown name falls back to operator/value inference.
+      let resolvePropertyType: ((name: string) => string | undefined) | undefined;
+      try {
+        const ds = await client.getDataSource(dsId);
+        const map: Record<string, string> = {};
+        for (const [name, v] of Object.entries(ds.properties ?? {})) {
+          if (v && typeof v === "object" && typeof (v as { type?: unknown }).type === "string") {
+            map[name] = (v as { type: string }).type;
+          }
+        }
+        resolvePropertyType = (name: string) =>
+          Object.prototype.hasOwnProperty.call(map, name) ? map[name] : undefined;
+      } catch {
+        /* schema fetch failed — fall back to inference, as elsewhere */
+      }
+
+      const emitted = emitViewBody(directives, {
+        ...(resolvePropertyType !== undefined ? { resolvePropertyType } : {}),
+      });
+      if (emitted.filter) body.filter = emitted.filter;
+      if (emitted.sorts) body.sorts = emitted.sorts;
+    } catch (e) {
+      if (e instanceof ViewParseError || e instanceof ViewEmitError) return textErr(e.message);
+      return textErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  // `is_archived` (2026-07-15) — query archived rows instead of live ones.
+  const isArchived = args.is_archived === true;
+  if (isArchived) body.is_archived = true;
+
+  const maxResults = typeof args.max_results === "number" ? args.max_results : 100;
+
+  try {
+    const collected = await client.queryDataSourceAll(dsId, body, { maxResults });
+
+    const lines: string[] = [
+      `# Rows in ${dsId}${isArchived ? " (archived)" : ""} — ${collected.results.length}`,
+      "",
+    ];
+    // Truncation banner first — see describeTruncation's doc comment.
+    const warning = describeTruncation(collected);
+    if (warning) lines.push(warning, "");
+
+    if (collected.results.length === 0) {
+      lines.push("_(no rows matched)_");
+    } else {
+      for (const row of collected.results) {
+        lines.push(`- **${extractRowTitle(row.properties) || "(untitled)"}**\n  id: ${row.id} · ${row.url ?? ""}`);
+      }
+    }
+    return { content: [{ type: "text", text: lines.join("\n") }] };
+  } catch (e) {
+    return textErr(`notion_query_data_source failed: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/** Pull the title cell out of a row's property bag for a readable listing. */
+function extractRowTitle(properties: Record<string, unknown> | undefined): string {
+  for (const v of Object.values(properties ?? {})) {
+    const p = v as { type?: string; title?: Array<{ plain_text?: string }> } | undefined;
+    if (p?.type === "title" && Array.isArray(p.title)) {
+      return p.title.map((t) => t?.plain_text ?? "").join("").trim();
+    }
+  }
+  return "";
 }
 
 // -----------------------------------------------------------------------------
@@ -184,13 +335,22 @@ async function updateDataSourceHandler(args: Record<string, unknown>, ctx: ToolC
   // source. If the caller passes it we apply it via a second PATCH to the
   // parent database — a small convenience.
   const maybeIsInline = typeof args.is_inline === "boolean" ? args.is_inline : undefined;
+  // `is_locked` is on the DATABASE's PATCH body whitelist, not the data
+  // source's — so it rides along with is_inline/description on the second
+  // PATCH below rather than the data-source PATCH above.
+  const maybeIsLocked = typeof args.is_locked === "boolean" ? args.is_locked : undefined;
   const maybeDescription = typeof args.description === "string" && args.description.length > 0
     ? args.description
     : undefined;
 
-  if (Object.keys(body).length === 0 && maybeIsInline === undefined && maybeDescription === undefined) {
+  if (
+    Object.keys(body).length === 0 &&
+    maybeIsInline === undefined &&
+    maybeIsLocked === undefined &&
+    maybeDescription === undefined
+  ) {
     return textErr(
-      "No changes specified. Pass at least one of: statements, title, description, in_trash, is_inline."
+      "No changes specified. Pass at least one of: statements, title, description, in_trash, is_inline, is_locked."
     );
   }
 
@@ -207,19 +367,20 @@ async function updateDataSourceHandler(args: Record<string, unknown>, ctx: ToolC
   // 2. If the caller passed is_inline or description, those live on the
   //    database object — push a second PATCH to the parent database.
   let dbPatched = false;
-  if (maybeIsInline !== undefined || maybeDescription !== undefined) {
+  if (maybeIsInline !== undefined || maybeDescription !== undefined || maybeIsLocked !== undefined) {
     const dsForParent = ds ?? (await client.getDataSource(dsId));
     const parentDbId = dsForParent?.database_parent?.database_id;
     if (!parentDbId) {
       // Soft error — the data-source change (if any) went through, but we
-      // couldn't find a parent database to apply is_inline/description to.
+      // couldn't find a parent database to apply is_inline/description/is_locked to.
       const lines = ["# Updated data source (partial)"];
       lines.push(`- data_source_id: ${dsId}`);
-      lines.push(`- warning: could not locate parent database to apply is_inline/description.`);
+      lines.push(`- warning: could not locate parent database to apply is_inline/description/is_locked.`);
       return { content: [{ type: "text", text: lines.join("\n") }], isError: true };
     }
     const dbBody: Record<string, unknown> = {};
     if (maybeIsInline !== undefined) dbBody.is_inline = maybeIsInline;
+    if (maybeIsLocked !== undefined) dbBody.is_locked = maybeIsLocked;
     if (maybeDescription !== undefined) dbBody.description = plainTextToRichText(maybeDescription);
     try {
       await client.updateDatabase(parentDbId, dbBody);
@@ -235,6 +396,7 @@ async function updateDataSourceHandler(args: Record<string, unknown>, ctx: ToolC
   if (statements) lines.push(`- applied ${countStatements(statements)} schema statement(s).`);
   if (typeof args.title === "string" && args.title) lines.push(`- title: ${args.title}`);
   if (maybeIsInline !== undefined) lines.push(`- is_inline: ${maybeIsInline}`);
+  if (maybeIsLocked !== undefined) lines.push(`- is_locked: ${maybeIsLocked}`);
   if (maybeDescription !== undefined) lines.push(`- description updated.`);
   if (typeof args.in_trash === "boolean") lines.push(`- in_trash: ${args.in_trash}`);
   if (dbPatched) lines.push(`- parent database also updated.`);

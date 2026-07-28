@@ -36,6 +36,12 @@ export function registerSearchTool(register: (def: ToolDef) => void): void {
           description: "Max results (default 25).",
         },
         start_cursor: { type: "string", description: "Pagination cursor from a prior call." },
+        in_trash: {
+          type: "boolean",
+          description:
+            "Search the TRASH instead of the workspace — returns trashed pages and data sources (Notion 2026-07-15). " +
+            "Default false. Use this to find something a user deleted before it is purged.",
+        },
       },
       required: ["account"],
       additionalProperties: false,
@@ -66,11 +72,22 @@ async function searchHandler(args: Record<string, unknown>, ctx: ToolContext): P
   if (filter === "database" || filter === "data_source") {
     body.filter = { value: "data_source", property: "object" };
   }
+  // `in_trash` (2026-07-15) lives on the SAME filter object as the object-type
+  // filter, so it must be merged rather than assigned — writing
+  // `body.filter = { in_trash }` would silently discard the type filter and
+  // return pages when the caller asked for data sources.
+  const inTrash = args.in_trash === true;
+  if (inTrash) body.filter = { ...(body.filter ?? {}), in_trash: true };
+
   if (typeof args.start_cursor === "string") body.start_cursor = args.start_cursor;
 
   const res = await client.search(body);
 
-  const lines: string[] = [`# Search results (${res.results.length}${res.has_more ? ", more available" : ""})`, ""];
+  const scope = inTrash ? " in trash" : "";
+  const lines: string[] = [
+    `# Search results${scope} (${res.results.length}${res.has_more ? ", more available" : ""})`,
+    "",
+  ];
   for (const item of res.results) {
     lines.push(formatSearchResult(item));
   }

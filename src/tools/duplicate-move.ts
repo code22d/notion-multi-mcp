@@ -438,7 +438,13 @@ function sourceParent(page: NotionPageObject): NormalizedParent | null {
   if (p.type === "data_source_id" && typeof p.data_source_id === "string") {
     return { type: "data_source_id", data_source_id: p.data_source_id };
   }
-  // workspace — can't duplicate a top-level page via API (requires admin).
+  // Everything else returns null, and the caller turns that into a clear
+  // "pass `parent` explicitly" error rather than crashing. Two cases land here:
+  //   - workspace: can't duplicate a top-level page via the API (needs admin).
+  //   - agent_id (2026-05-11): pages parented by an agent serialize as
+  //     `{ type: "agent_id", agent_id: "…" }`. There is no way to create a
+  //     page under an agent via the public API, so a duplicate must be given
+  //     a destination. Falling through here is the correct answer, not a gap.
   return null;
 }
 

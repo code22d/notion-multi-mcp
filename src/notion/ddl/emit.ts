@@ -184,14 +184,22 @@ function emitPropertyConfig(col: ColumnDef): EmittedPropertyConfig {
       };
 
     case "status":
-      // Note: Notion's request API doesn't accept a `groups` field — groups
-      // are assigned server-side. We drop StatusOption.group during emit.
+      // Since 2026-06-22 a status option carries an optional `group`
+      // ("To-do" / "In progress" / "Complete"). Before that, groups were
+      // assigned server-side and this emitter dropped the parsed value on the
+      // floor — the DDL grammar has always accepted `'name':'group':color`.
+      //
+      // Omitting `group` is still meaningful, and deliberately preserved: on
+      // an UPDATE, an option with no group keeps whatever group it already
+      // has. Emitting a default here would silently re-file every existing
+      // option, so absent stays absent.
       return {
         type: "status",
         status: {
           options: t.options.map((o) => ({
             name: o.name,
             ...(o.color !== undefined ? { color: o.color } : {}),
+            ...(o.group !== undefined ? { group: normalizeStatusGroup(o.group) } : {}),
           })),
         },
       };
@@ -267,4 +275,35 @@ export function plainTextToRichText(text: string): Array<{ type: "text"; text: {
 /** Re-exported kind guard for tests. */
 export function propertyKind(t: PropertyTypeAst): PropertyTypeAst["kind"] {
   return t.kind;
+}
+
+/**
+ * Map a status group written in the DDL onto the exact string Notion expects.
+ *
+ * Notion accepts precisely three: "To-do", "In progress", "Complete" — with
+ * that capitalisation and that hyphen. Nobody types them that way reliably,
+ * so common spellings ("todo", "to do", "in_progress", "done") are folded onto
+ * the canonical form.
+ *
+ * Anything unrecognised is passed through UNCHANGED rather than rejected. If
+ * Notion ever adds a fourth group, a DDL naming it keeps working without a
+ * release here; and if it's simply a typo, Notion's own error names the valid
+ * values more authoritatively than we could.
+ */
+export function normalizeStatusGroup(raw: string): string {
+  const key = raw.trim().toLowerCase().replace(/[\s_-]+/g, "");
+  switch (key) {
+    case "todo":
+    case "notstarted":
+      return "To-do";
+    case "inprogress":
+    case "doing":
+      return "In progress";
+    case "complete":
+    case "completed":
+    case "done":
+      return "Complete";
+    default:
+      return raw;
+  }
 }

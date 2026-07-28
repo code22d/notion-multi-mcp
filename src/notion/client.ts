@@ -237,7 +237,9 @@ export class NotionClient {
     query?: string;
     sort?: { direction: "ascending" | "descending"; timestamp: "last_edited_time" };
     // API 2025-09-03 renamed filter value from "database" to "data_source".
-    filter?: { value: "page" | "data_source"; property: "object" };
+    // `in_trash` (2026-07-15) is a SEPARATE key on the same filter object, not
+    // another `value` — set it to list trashed pages and data sources.
+    filter?: { value?: "page" | "data_source"; property?: "object"; in_trash?: boolean };
     start_cursor?: string;
     page_size?: number;
   }): Promise<PaginatedList<NotionPageObject | NotionDatabaseObject | NotionDataSourceObject>> {

@@ -13,6 +13,7 @@ import { registerPageTools } from "../tools/pages";
 import { registerDatabaseTools } from "../tools/databases";
 import { registerViewTools } from "../tools/views";
 import { registerDuplicateAndMoveTools } from "../tools/duplicate-move";
+import { registerFileTools } from "../tools/files";
 
 export function registerAllTools(register: (def: ToolDef) => void): void {
   // Account management (no Notion API calls — pure KV)
@@ -33,4 +34,7 @@ export function registerAllTools(register: (def: ToolDef) => void): void {
   registerViewTools(register);
   registerCommentTools(register);
   registerDuplicateAndMoveTools(register);
+
+  // 2026 API catch-up — file uploads, HTML blocks, custom emojis
+  registerFileTools(register);
 }

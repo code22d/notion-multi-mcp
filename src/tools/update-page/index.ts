@@ -36,7 +36,9 @@ export const UPDATE_PAGE_INPUT_SCHEMA = {
         "Required for `update_properties`. Flat map of property names to scalar values (string | number | null). " +
         "Date props split into `date:{name}:start|end|is_datetime`. Place props split into " +
         "`place:{name}:{name|address|latitude|longitude|google_place_id}`. Checkboxes use `__YES__`/`__NO__`. " +
-        "Properties colliding with `id` or `url` must be prefixed `userDefined:`.",
+        "Properties colliding with `id` or `url` must be prefixed `userDefined:`. " +
+        "Three reserved keys are page-level controls rather than columns: `in_trash` (move to/from trash), " +
+        "`archived` (legacy alias for in_trash), and `is_locked` (lock the page against edits in the Notion UI).",
     },
     content_updates: {
       type: "array",
@@ -69,7 +71,9 @@ export const UPDATE_PAGE_INPUT_SCHEMA = {
     icon: {
       type: "string",
       description:
-        "Page icon — an emoji character, a `:name:` custom emoji, an https URL, or \"none\" to remove. " +
+        "Page icon — an emoji character, `icon:<name>` or `icon:<name>:<color>` for a native Notion icon " +
+        "(e.g. `icon:pizza:blue`, `icon:star circle`), `:name:` or `custom_emoji:<id>` for a custom emoji " +
+        "(ids come from notion_list_custom_emojis), an https URL, or \"none\" to remove. " +
         "Can be set alongside any command.",
     },
     verification_status: {
