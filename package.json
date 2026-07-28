@@ -9,7 +9,7 @@
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
     "typecheck": "tsc --noEmit",
-    "test": "tsx test/roundtrip.ts && tsx test/ddl-roundtrip.ts && tsx test/view-roundtrip.ts && tsx test/duplicate-page.ts && tsx test/update-page-roundtrip.ts && tsx test/account-store.ts && tsx test/comments.ts && tsx test/bug-regressions.ts && tsx test/property-values.ts"
+    "test": "tsx test/roundtrip.ts && tsx test/ddl-roundtrip.ts && tsx test/view-roundtrip.ts && tsx test/duplicate-page.ts && tsx test/update-page-roundtrip.ts && tsx test/account-store.ts && tsx test/comments.ts && tsx test/bug-regressions.ts && tsx test/property-values.ts && tsx test/client-retry.ts"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20250419.0",

@@ -7,10 +7,63 @@
 import type { NotionAccount } from "../mcp/types";
 
 const NOTION_API = "https://api.notion.com/v1";
-const NOTION_VERSION = "2025-09-03";
+export const NOTION_VERSION = "2025-09-03";
+
+// -----------------------------------------------------------------------------
+// Retry policy
+//
+// Notion advertises a retry delay via the `Retry-After` response header on 429
+// (rate_limited) and 529 (service_overload). The docs describe it as "an
+// integer number of seconds (in decimal)"; we also tolerate the HTTP-date form
+// that RFC 9110 permits, since a proxy in front of the API could emit it.
+//
+// Why this matters more than it used to: on 2026-06-16 Notion added a
+// WORKSPACE-level rate limit shared across every connection into a workspace
+// and scaled to plan, layered on top of the existing per-connection limit.
+// Several connectors share this workspace's budget, so 429s are realistic and
+// Notion's advertised delay can far exceed the old fixed 1.4s backoff ceiling.
+//
+// Attempt counts differ by class, because the two failures mean different
+// things:
+//   - 429 gets MAX_ATTEMPTS_429 tries. When Notion tells us exactly how long to
+//     wait, sleeping that long and retrying is very likely to succeed, so extra
+//     attempts are cheap in expectation.
+//   - 5xx gets MAX_ATTEMPTS_5XX tries (unchanged from the original code). A
+//     server error carries no promise that waiting helps.
+//
+// Two ceilings bound the worst case, because a Cloudflare Worker cannot sleep
+// indefinitely — the MCP client's HTTP request is held open the whole time:
+//   - MAX_SINGLE_SLEEP_MS caps one sleep, so a hostile or buggy Retry-After
+//     (e.g. "86400") can't park a Worker for a day.
+//   - MAX_TOTAL_SLEEP_MS caps the sum across all attempts of one request.
+// Exceeding either is surfaced as a clear error naming the advertised delay,
+// rather than silently clamping and retrying too early (which would just burn
+// another request against the limit we're already over).
+const MAX_ATTEMPTS_429 = 5;
+const MAX_ATTEMPTS_5XX = 3;
+const MAX_SINGLE_SLEEP_MS = 60_000;
+const MAX_TOTAL_SLEEP_MS = 60_000;
+
+/** Seams for tests — production passes neither and gets global fetch + real sleep. */
+export interface NotionClientOptions {
+  /** Injectable fetch. Defaults to the global. */
+  fetchImpl?: typeof fetch;
+  /** Injectable sleep. Defaults to a real setTimeout. Tests record instead of waiting. */
+  sleepImpl?: (ms: number) => Promise<void>;
+  /** Injectable clock, used only to resolve HTTP-date `Retry-After` values. */
+  nowImpl?: () => number;
+}
 
 export class NotionClient {
-  constructor(private readonly account: NotionAccount) {}
+  private readonly fetchImpl: typeof fetch;
+  private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly nowImpl: () => number;
+
+  constructor(private readonly account: NotionAccount, opts: NotionClientOptions = {}) {
+    this.fetchImpl = opts.fetchImpl ?? ((input, init) => fetch(input as RequestInfo, init));
+    this.sleepImpl = opts.sleepImpl ?? sleep;
+    this.nowImpl = opts.nowImpl ?? (() => Date.now());
+  }
 
   // -------------------------------------------------------------------
   // Low-level request
@@ -38,10 +91,18 @@ export class NotionClient {
       body = JSON.stringify(init.body);
     }
 
-    // Simple retry for 429 and 5xx
+    // Retry 429 (rate_limited) and 5xx. HTTP 529 `service_overload` needs no
+    // branch of its own: 529 >= 500, so it already lands in the 5xx arm, and
+    // Notion's own docs say to "handle it the same way" as a 429 — which the
+    // Retry-After path below does, since we read the header on both classes.
     let lastError: Error | null = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const res = await fetch(url.toString(), { method, headers, body });
+    let totalSlept = 0;
+    let attempt = 0;
+    // Bound the loop by the larger of the two budgets; the per-class check
+    // inside decides when to actually give up.
+    const maxAttempts = Math.max(MAX_ATTEMPTS_429, MAX_ATTEMPTS_5XX);
+    while (attempt < maxAttempts) {
+      const res = await this.fetchImpl(url.toString(), { method, headers, body });
       if (res.ok) {
         return (await res.json()) as T;
       }
@@ -55,15 +116,43 @@ export class NotionClient {
       }
       const msg = parsed?.message ?? text;
 
-      if (res.status === 429 || res.status >= 500) {
-        lastError = new Error(`Notion API ${res.status}: ${msg}`);
-        // Exponential backoff (100ms, 400ms, 900ms)
-        await sleep(100 * Math.pow(attempt + 1, 2));
-        continue;
+      const isRateLimited = res.status === 429;
+      const retriable = isRateLimited || res.status >= 500;
+      if (!retriable) {
+        // Non-retriable
+        throw new Error(`Notion API ${res.status}: ${msg}`);
       }
 
-      // Non-retriable
-      throw new Error(`Notion API ${res.status}: ${msg}`);
+      lastError = new Error(`Notion API ${res.status}: ${msg}`);
+      attempt++;
+      const attemptsForClass = isRateLimited ? MAX_ATTEMPTS_429 : MAX_ATTEMPTS_5XX;
+      if (attempt >= attemptsForClass) break;
+
+      // Prefer Notion's advertised delay; fall back to the original
+      // exponential curve (100ms, 400ms, 900ms, …) when the header is absent.
+      const advertised = parseRetryAfterMs(readHeader(res, "retry-after"), this.nowImpl());
+      let waitMs: number;
+      if (advertised !== null) {
+        if (advertised > MAX_SINGLE_SLEEP_MS) {
+          throw new Error(
+            `Notion API ${res.status}: ${msg} — Retry-After asked for ${Math.round(advertised / 1000)}s, ` +
+              `which exceeds this client's ${MAX_SINGLE_SLEEP_MS / 1000}s single-wait ceiling. ` +
+              `Retry the operation later.`
+          );
+        }
+        waitMs = advertised;
+      } else {
+        waitMs = 100 * Math.pow(attempt, 2);
+      }
+
+      if (totalSlept + waitMs > MAX_TOTAL_SLEEP_MS) {
+        throw new Error(
+          `Notion API ${res.status}: ${msg} — retrying would exceed this client's ` +
+            `${MAX_TOTAL_SLEEP_MS / 1000}s total-wait budget for one request. Retry the operation later.`
+        );
+      }
+      totalSlept += waitMs;
+      await this.sleepImpl(waitMs);
     }
     throw lastError ?? new Error("Notion API: unknown error");
   }
@@ -403,6 +492,67 @@ export type NotionCover =
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Read a response header without assuming a full `Headers` implementation.
+ * Test stubs commonly hand back a plain object for `headers`, and a
+ * `Response`-shaped duck type is easier to fake than the real thing.
+ */
+function readHeader(res: { headers?: unknown }, name: string): string | null {
+  const h = res.headers as
+    | { get?: (n: string) => string | null }
+    | Record<string, string>
+    | undefined;
+  if (!h) return null;
+  if (typeof (h as { get?: unknown }).get === "function") {
+    return (h as { get: (n: string) => string | null }).get(name) ?? null;
+  }
+  const rec = h as Record<string, string>;
+  const lower = name.toLowerCase();
+  for (const k of Object.keys(rec)) {
+    if (k.toLowerCase() === lower) return rec[k] ?? null;
+  }
+  return null;
+}
+
+/**
+ * Parse a `Retry-After` header into milliseconds.
+ *
+ * Notion documents the value as "an integer number of seconds (in decimal)".
+ * RFC 9110 also allows an HTTP-date, so we accept that form and resolve it
+ * against `now` — a date in the past (clock skew, or a stale value) yields 0
+ * rather than a negative sleep.
+ *
+ * Returns null when the header is absent or unparseable, which tells the
+ * caller to fall back to the exponential backoff curve. Fail-soft on purpose:
+ * a malformed header must not turn a retriable error into a hard failure.
+ */
+export function parseRetryAfterMs(raw: string | null | undefined, now: number): number | null {
+  if (raw === null || raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+
+  // Integer seconds (the documented form). Reject anything with a sign or a
+  // fractional part — those aren't valid delta-seconds and are more likely to
+  // be a bug at the other end than an intentional delay.
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number(trimmed);
+    if (!Number.isFinite(seconds)) return null;
+    return seconds * 1000;
+  }
+
+  // HTTP-date form. Guard with a letter check before handing anything to
+  // Date.parse: `Date.parse("-5")` and `Date.parse("1.5")` both SUCCEED, read
+  // as the years -5 and 1.5, which would turn a malformed delta-seconds value
+  // into a two-thousand-year sleep request. Every HTTP-date format RFC 9110
+  // permits (IMF-fixdate, RFC 850, asctime) carries a day or month name, and
+  // ISO-8601 carries `T`/`Z` — so requiring at least one letter admits every
+  // real date form while rejecting bare numerics.
+  if (!/[A-Za-z]/.test(trimmed)) return null;
+  const at = Date.parse(trimmed);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, at - now);
 }
 
 export function stripDashes(id: string): string {
