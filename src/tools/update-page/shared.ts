@@ -4,10 +4,22 @@
 
 import type { ToolResult } from "../../mcp/types";
 import type { NotionBlockObject, NotionClient } from "../../notion/client";
+import type { ClonePolicy } from "../../notion/block-clone";
+import { cloneBlockTree } from "../../notion/block-clone";
 import type { HydratedBlock } from "../../notion/markdown/from-blocks";
 import type { BlockRequest } from "../../notion/markdown/to-blocks";
 
-export const CHILDREN_PER_REQUEST = 100;
+import { requiresChildren } from "../../notion/block-write-schema";
+
+// The clone/append machinery lives in src/notion/block-clone.ts so duplicate_page
+// and apply_template run the exact same code — the drift between two copies of
+// it is what produced the null-icon bug and then the tab.children bug. Re-exported
+// here so every existing import path keeps working.
+export {
+  CHILDREN_PER_REQUEST,
+  appendInChunks,
+  stripResponseOnlyNulls,
+} from "../../notion/block-clone";
 
 export function textOk(text: string): ToolResult {
   return { content: [{ type: "text", text }] };
@@ -33,12 +45,25 @@ export async function hydrateChildren(
   const out: HydratedBlock[] = [];
   for (const child of direct) {
     const h: HydratedBlock = { ...child } as HydratedBlock;
-    if (child.has_children) {
+    if (shouldDescendInto(child)) {
       h.children = await hydrateChildren(client, child.id);
     }
     out.push(h);
   }
   return out;
+}
+
+/**
+ * `has_children` is the normal signal, but for a container whose write schema
+ * makes `children` REQUIRED we look anyway. Getting this wrong for those types
+ * is not a cosmetic loss — it produces a request body Notion rejects outright,
+ * naming a field the user never supplied. One extra (empty) list call for a
+ * genuinely empty table/tab is a cheap price for not depending on a flag whose
+ * behaviour we cannot verify from here.
+ */
+export function shouldDescendInto(block: NotionBlockObject | HydratedBlock): boolean {
+  if (block.has_children) return true;
+  return typeof block.type === "string" && requiresChildren(block.type);
 }
 
 /**
@@ -65,98 +90,32 @@ export function normalizeId(id: string): string {
 }
 
 /**
- * Strip response-only null fields from a block's type-body object in place.
- *
- * Notion's GET responses include fields like `icon: null`, `color: null`,
- * `caption: null` on most block bodies, but the POST/PATCH schema rejects
- * `null` for those fields — they must be an object or absent. Calling this on
- * a type body (e.g. `block.paragraph`, `block.callout`) removes any top-level
- * key whose value is `null`, with one exception: `synced_from: null` is a
- * meaningful signal for a synced_block ORIGINAL (vs a reference), so we keep
- * it when `type === "synced_block"`.
- *
- * Shared between apply_template's `cloneBlockForRequest` and
- * duplicate_page's `sanitizeTypeBody` so the two paths can't drift when Notion
- * adds new response-only nullable fields.
+ * apply_template's clone policy: a block with no write shape is dropped, and
+ * a synced_block reference keeps pointing at the same original (the template
+ * and the target live in one workspace, so mirroring is meaningful there).
  */
-export function stripResponseOnlyNulls(body: Record<string, unknown>, type: string): void {
-  for (const key of Object.keys(body)) {
-    if (body[key] === null) {
-      if (type === "synced_block" && key === "synced_from") continue;
-      delete body[key];
-    }
-  }
-}
+export const TEMPLATE_CLONE_POLICY: ClonePolicy = {
+  substitute: () => null,
+  syncedReference: "keep-link",
+};
 
 /**
- * Convert a hydrated response-shape block into a request-shape BlockRequest,
- * stripping fields the create/append endpoints reject (id, timestamps, parent,
- * etc.). Children are cloned recursively.
+ * Convert a hydrated response-shape block into a request-shape BlockRequest.
  *
  * Returns null for block types that cannot be re-created via the API — most
  * notably `child_page` and `child_database`, which reference workspace entities
  * rather than carrying reproducible content. The caller skips nulls.
+ *
+ * This is the SHALLOW view of the clone: it hands back the request body and
+ * discards the record of anything that had to be appended separately. Callers
+ * that actually send the result want `cloneBlockTree` + `appendClonedTree`
+ * instead, or deep templates lose the subtrees Notion's request schema won't
+ * carry inline. Kept for callers (and tests) that only care about the shape of
+ * one block.
  */
 export function cloneBlockForRequest(block: HydratedBlock): BlockRequest | null {
-  const type = block.type;
-  if (!type) return null;
-  // Structural refs to other workspace entities — can't be "applied" to a new
-  // page; would create a dangling reference or a circular copy.
-  if (type === "child_page" || type === "child_database") return null;
-  // Unsupported blocks carry no reconstructable payload.
-  if (type === "unsupported") return null;
-
-  const payload = (block as unknown as Record<string, unknown>)[type];
-  if (!payload || typeof payload !== "object") return null;
-
-  // Strip runtime-only fields from nested block objects (table_row's `cells`
-  // stays; everything else we keep). Deep-clone via JSON to avoid aliasing.
-  const clonedPayload = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>;
-  // Notion's GET response includes fields like `icon: null` / `color: null` on
-  // most block bodies, but its POST/PATCH schema rejects `null` for those —
-  // strip response-only nulls before we send the request.
-  stripResponseOnlyNulls(clonedPayload, type);
-  // `children` inside the payload (e.g. column_list.column_list.children) —
-  // we'll rebuild from the hydrated block.children, but certain types carry
-  // an inline children array (table → rows). Leave those alone.
-  const request: BlockRequest = {
-    type,
-    [type]: clonedPayload,
-  };
-
-  // Attach recursively-cloned children for container types (toggle, callout,
-  // quote, bulleted/numbered/to_do list items, column_list, column, synced_block).
-  if (block.children && block.children.length > 0) {
-    const childRequests: BlockRequest[] = [];
-    for (const c of block.children) {
-      const cloned = cloneBlockForRequest(c);
-      if (cloned) childRequests.push(cloned);
-    }
-    if (childRequests.length > 0) {
-      // Notion expects `children` under the type-payload for most containers.
-      // For table, children are table_row objects under the payload. Our
-      // from-blocks output keeps table rows under block.children too, so the
-      // same shape works.
-      (clonedPayload as Record<string, unknown>).children = childRequests;
-    }
-  }
-
-  return request;
-}
-
-/**
- * Append a list of BlockRequests under `parentId` in 100-item chunks
- * (Notion's per-call cap).
- */
-export async function appendInChunks(
-  client: NotionClient,
-  parentId: string,
-  blocks: BlockRequest[]
-): Promise<void> {
-  for (let i = 0; i < blocks.length; i += CHILDREN_PER_REQUEST) {
-    const slice = blocks.slice(i, i + CHILDREN_PER_REQUEST);
-    await client.appendBlockChildren(parentId, { children: slice });
-  }
+  const [cloned] = cloneBlockTree([block], TEMPLATE_CLONE_POLICY);
+  return cloned ? cloned.request : null;
 }
 
 // Icon helpers moved to src/notion/icons.ts so the Markdown converter can use

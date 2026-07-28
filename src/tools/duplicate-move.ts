@@ -22,13 +22,22 @@ import type { ToolContext, ToolDef, ToolResult } from "../mcp/types";
 import { resolveAccount, ACCOUNT_PARAM_SCHEMA, createNotionClient } from "../accounts/resolver";
 import {
   NotionClient,
-  type NotionBlockObject,
   type NotionPageObject,
   type NotionRichText,
 } from "../notion/client";
-import { sanitizeIconForWrite, stripResponseOnlyNulls } from "./update-page/shared";
+import {
+  CHILDREN_PER_REQUEST,
+  cloneBlockTree,
+  resolvePendingChildren,
+  type ClonePolicy,
+  type ClonedBlock,
+} from "../notion/block-clone";
+import type { HydratedBlock } from "../notion/markdown/from-blocks";
+import type { BlockRequest } from "../notion/markdown/to-blocks";
+import { sanitizeIconForWrite, shouldDescendInto } from "./update-page/shared";
 
-const CHILDREN_PER_REQUEST = 100;
+// Re-exported: the walker and the tests have always imported these from here.
+export type { HydratedBlock, BlockRequest };
 
 export function registerDuplicateAndMoveTools(register: (def: ToolDef) => void): void {
   register({
@@ -119,8 +128,11 @@ async function duplicatePageHandler(args: Record<string, unknown>, ctx: ToolCont
     return textErr(`Couldn't read source block tree: ${msg}`);
   }
 
-  // 5) Convert the response tree into request-shaped children.
-  const children = blockTree.map(toBlockRequest).filter((b): b is BlockRequest => b !== null);
+  // 5) Convert the response tree into request-shaped children. `cloned` keeps
+  //    one entry per block we actually emit, in emit order, plus a record of
+  //    every subtree the request body could not carry inline.
+  const cloned = cloneBlockTree(blockTree, DUPLICATE_CLONE_POLICY);
+  const children = cloned.map((c) => c.request);
 
   // 6) Create the new page with the first chunk of children.
   let created: NotionPageObject;
@@ -149,10 +161,10 @@ async function duplicatePageHandler(args: Record<string, unknown>, ctx: ToolCont
       });
     }
 
-    // Hydrate nested children under the newly created top-level blocks. We need
-    // to fetch the created blocks to get their real IDs before we can attach
-    // their children — do this in one pass per depth level.
-    await hydrateChildrenRecursive(client, created.id, blockTree);
+    // Attach whatever the request bodies couldn't carry inline. The page was
+    // just created, so its children are exactly the blocks we emitted, in
+    // order — which is what lets the resolver pair them up by index.
+    await resolvePendingChildren(client, created.id, cloned, DUPLICATE_CLONE_POLICY);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return textErr(`notion_duplicate_page failed during creation: ${msg}`);
@@ -173,17 +185,14 @@ async function duplicatePageHandler(args: Record<string, unknown>, ctx: ToolCont
 // Block walker — fetch source tree
 // -----------------------------------------------------------------------------
 
-export interface HydratedBlock extends NotionBlockObject {
-  children?: HydratedBlock[];
-}
-
 async function fetchChildrenRecursive(client: NotionClient, blockId: string): Promise<HydratedBlock[]> {
   const top = await client.listAllBlockChildren(blockId);
-  // Paginate children of each block with has_children=true, one level deep; recurse.
   const out: HydratedBlock[] = [];
   for (const block of top) {
-    const h = block as HydratedBlock;
-    if (block.has_children) {
+    const h = { ...block } as HydratedBlock;
+    // shouldDescendInto also descends into containers whose write schema makes
+    // `children` mandatory, regardless of has_children — see its comment.
+    if (shouldDescendInto(block)) {
       h.children = await fetchChildrenRecursive(client, block.id);
     }
     out.push(h);
@@ -195,82 +204,42 @@ async function fetchChildrenRecursive(client: NotionClient, blockId: string): Pr
 // Block request-shape conversion
 // -----------------------------------------------------------------------------
 
-export type BlockRequest = Record<string, unknown> & { type: string };
-
-/** Fields Notion's REST API returns but doesn't accept on write. */
-const STRIPPED_FIELDS = new Set<string>([
-  "object", "id", "created_time", "last_edited_time", "created_by",
-  "last_edited_by", "has_children", "archived", "in_trash", "parent",
-  "request_id",
-]);
-
-export function toBlockRequest(block: HydratedBlock): BlockRequest | null {
-  const type = block.type;
-  if (!type) return null;
-
-  // Types with no clean public-API creation path — substitute a note so the
-  // structure is preserved but the duplicate doesn't crash on the server.
-  if (
-    type === "unsupported" ||
-    type === "child_database" ||
-    type === "ai_block" ||
-    type === "breadcrumb" ||
-    type === "table_of_contents"
-  ) {
-    return paragraphPlaceholder(`[original ${type} not duplicable via public API]`);
-  }
-
-  // synced_block (the "original") exposes its children via the usual API. The
-  // "reference" form (a mirror) can't be faithfully re-linked, so we inline
-  // the original's children as a toggle-less group.
-  if (type === "synced_block") {
-    const sb = (block as Record<string, unknown>)[type] as { synced_from?: unknown } | undefined;
-    if (sb && sb.synced_from) {
-      // Reference — can't duplicate. Replace with a paragraph note.
+/**
+ * duplicate_page's clone policy. Where a block has no create shape at all, the
+ * duplicate keeps a visible italic note in its place rather than silently
+ * losing the structure — the user asked for a copy of a page and should be able
+ * to see what didn't survive.
+ *
+ * `breadcrumb` and `table_of_contents` used to be listed here too. They are
+ * both perfectly creatable at the top level of a request, so they now clone
+ * properly instead of degrading to a note.
+ */
+export const DUPLICATE_CLONE_POLICY: ClonePolicy = {
+  substitute(block, kind) {
+    if (kind === "child_page") {
+      const cp = (block as unknown as Record<string, unknown>).child_page as { title?: string } | undefined;
+      return paragraphPlaceholder(`[child page: ${cp?.title ?? "(untitled)"} — not recursively duplicated]`);
+    }
+    if (kind === "synced_reference") {
       return paragraphPlaceholder("[original synced block not duplicable via public API]");
     }
-    // Originals: emit a fresh synced_block with synced_from=null — Notion
-    // will create a new original that mirrors the children we append.
-    return {
-      type: "synced_block",
-      synced_block: { synced_from: null },
-    };
-  }
+    return paragraphPlaceholder(`[original ${block.type} not duplicable via public API]`);
+  },
+  // A duplicate that mirrored the source's synced blocks would quietly couple
+  // the copy to the original; duplicate_page has always left a note instead.
+  syncedReference: "substitute",
+};
 
-  // child_page — when Notion's API returns child_page, the only creation path
-  // is a nested page (new page with parent=current page). We can't do that
-  // inline during duplicate, so emit a note with the original's title.
-  if (type === "child_page") {
-    const cp = (block as Record<string, unknown>)[type] as { title?: string } | undefined;
-    const t = cp?.title ?? "(untitled)";
-    return paragraphPlaceholder(`[child page: ${t} — not recursively duplicated]`);
-  }
-
-  // Clone the block, stripping server-only fields.
-  const payload = cloneShallow(block);
-  for (const k of STRIPPED_FIELDS) delete (payload as Record<string, unknown>)[k];
-
-  // Drop our recursion helper.
-  delete (payload as Record<string, unknown>).children;
-
-  // Sanitize the per-type body (file.url with notion-hosted signed URL becomes
-  // external).
-  sanitizeTypeBody(payload, type);
-
-  // Some block types can carry inline children at creation time (toggle,
-  // quote, callout, column_list, column, table, bulleted_list_item, etc.).
-  // Our recursion walker attaches children later via appendBlockChildren,
-  // but we also set them inline when available to reduce API calls.
-  if (block.children && block.children.length > 0 && supportsInlineChildren(type)) {
-    const body = (payload as Record<string, unknown>)[type] as Record<string, unknown> | undefined;
-    if (body) {
-      body.children = block.children.map(toBlockRequest).filter((b): b is BlockRequest => b !== null);
-      // Once inlined, don't re-attach in the hydrate pass.
-      block.children = undefined;
-    }
-  }
-
-  return payload as BlockRequest;
+/**
+ * Convert one response-shape block into its request shape.
+ *
+ * Thin view over the shared clone engine — it discards the engine's record of
+ * subtrees that need a follow-up append, so the handler uses `cloneBlockTree`
+ * directly. Kept exported because it is the seam the block-shape tests use.
+ */
+export function toBlockRequest(block: HydratedBlock): BlockRequest | null {
+  const [cloned] = cloneBlockTree([block], DUPLICATE_CLONE_POLICY);
+  return cloned ? cloned.request : null;
 }
 
 function cloneShallow<T extends Record<string, unknown>>(obj: T): T {
@@ -289,96 +258,11 @@ function paragraphPlaceholder(text: string): BlockRequest {
   };
 }
 
-/** Types whose request body accepts a `children` array inline. */
-function supportsInlineChildren(type: string): boolean {
-  return (
-    type === "toggle" ||
-    type === "quote" ||
-    type === "callout" ||
-    type === "column_list" ||
-    type === "column" ||
-    type === "synced_block" ||
-    type === "bulleted_list_item" ||
-    type === "numbered_list_item" ||
-    type === "to_do" ||
-    type === "table" ||
-    type === "heading_1" ||
-    type === "heading_2" ||
-    type === "heading_3"
-  );
-}
-
-function sanitizeTypeBody(payload: Record<string, unknown>, type: string): void {
-  const body = payload[type];
-  if (!body || typeof body !== "object") return;
-  const b = body as Record<string, unknown>;
-
-  // Files returned as `{ type: "file", file: { url, expiry_time } }` can't be
-  // round-tripped — convert to external using the signed URL while it's fresh.
-  if (b.type === "file" && b.file && typeof b.file === "object") {
-    const f = b.file as { url?: string };
-    if (f.url) {
-      b.type = "external";
-      b.external = { url: f.url };
-      delete b.file;
-    }
-  }
-
-  // Strip top-level null-valued fields from the type body. Notion's block
-  // response shape includes things like `icon: null` and `color: null` on
-  // most block bodies, but the request schema rejects `null` for those
-  // fields (they must be an object or absent). Delegated to the shared
-  // helper so this path and apply_template's clone path can't drift.
-  stripResponseOnlyNulls(b, type);
-
-  // Rich text runs also carry a plain_text and href that the API recomputes —
-  // safe to keep but the API ignores them. We leave them as-is.
-}
-
-// -----------------------------------------------------------------------------
-// Hydrate nested children after page creation
-// -----------------------------------------------------------------------------
-
-/**
- * After createPage with the top-level children, Notion assigns new block IDs.
- * We list the new page's children and, in order, append each original block's
- * sub-tree under the matching new block. Only runs for blocks whose children
- * weren't already inlined at request-build time.
- */
-async function hydrateChildrenRecursive(
-  client: NotionClient,
-  parentBlockId: string,
-  sourceTree: HydratedBlock[]
-): Promise<void> {
-  // Only fetch if there's anything to hydrate under this parent.
-  if (!sourceTree.some(hasPendingChildren)) return;
-
-  const createdChildren = await client.listAllBlockChildren(parentBlockId);
-
-  // Notion appends the new blocks in the same order as our request, but skips
-  // nothing. Our sourceTree may contain placeholder paragraphs (for
-  // non-duplicable types) that don't need hydration — those entries have
-  // `children` undefined. Iterate in order and pair by index.
-  for (let i = 0; i < sourceTree.length && i < createdChildren.length; i++) {
-    const src = sourceTree[i]!;
-    const dst = createdChildren[i]!;
-    if (!src.children || src.children.length === 0) continue;
-
-    // Append this level of children, then recurse.
-    const childrenPayload = src.children.map(toBlockRequest).filter((b): b is BlockRequest => b !== null);
-    for (let off = 0; off < childrenPayload.length; off += CHILDREN_PER_REQUEST) {
-      await client.appendBlockChildren(dst.id, {
-        children: childrenPayload.slice(off, off + CHILDREN_PER_REQUEST),
-      });
-    }
-    await hydrateChildrenRecursive(client, dst.id, src.children);
-  }
-}
-
-function hasPendingChildren(b: HydratedBlock): boolean {
-  if (!b.children || b.children.length === 0) return false;
-  return true;
-}
+// Which blocks may carry inline children, and how deep, is no longer a list
+// kept here — it is derived from src/notion/block-write-schema.ts by the shared
+// clone engine. The old local list said "toggle, quote, callout, …" with no
+// notion of depth and no notion of a container whose children are REQUIRED,
+// which is exactly how `tab` slipped through.
 
 // -----------------------------------------------------------------------------
 // Parent & property helpers

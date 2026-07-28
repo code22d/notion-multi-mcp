@@ -76,8 +76,16 @@ console.log("\n=== duplicate_page: toBlockRequest ===");
     const body = (out as Record<string, unknown>).toggle as { children?: BlockRequest[] } | undefined;
     assert(Array.isArray(body?.children) && body!.children!.length === 1, "toggle inlined one child");
     assert(body?.children?.[0]?.type === "paragraph", "inlined child is a paragraph");
-    // Since inlined, children reference was cleared on the source.
-    assert(parent.children === undefined, "source.children cleared after inline");
+    // The clone engine treats the hydrated response tree as read-only. It used
+    // to blank `block.children` as a marker that the subtree had been inlined,
+    // which meant cloning twice produced different bodies the second time.
+    assert(
+      Array.isArray(parent.children) && parent.children.length === 1,
+      "source tree is not mutated by cloning"
+    );
+    const again = toBlockRequest(parent);
+    const againBody = again ? ((again as Record<string, unknown>).toggle as { children?: BlockRequest[] }) : undefined;
+    assert(againBody?.children?.length === 1, "cloning the same block twice yields the same body");
   }
 }
 
@@ -165,20 +173,34 @@ console.log("\n=== duplicate_page: toBlockRequest ===");
   assert(body !== undefined && "synced_from" in body && body!.synced_from === null, "synced_from: null retained");
 }
 
-// 10) column_list + column with nested paragraph — inlined hierarchy preserved.
+// 10) column_list + columns with nested paragraphs — inlined hierarchy preserved.
 {
-  const inner = hydratedBlock("paragraph", { rich_text: [{ type: "text", text: { content: "col item" } }] });
-  const column = hydratedBlock("column", {}, { children: [inner] });
-  const columnList = hydratedBlock("column_list", {}, { children: [column] });
+  const col = (text: string) =>
+    hydratedBlock("column", {}, {
+      children: [hydratedBlock("paragraph", { rich_text: [{ type: "text", text: { content: text } }] })],
+    });
+  const columnList = hydratedBlock("column_list", {}, { children: [col("left"), col("right")] });
   const out = toBlockRequest(columnList);
   assert(out?.type === "column_list", "column_list preserved");
   const listBody = out ? ((out as Record<string, unknown>).column_list as { children?: BlockRequest[] }) : undefined;
-  assert(Array.isArray(listBody?.children) && listBody!.children!.length === 1, "column_list has one child");
+  assert(Array.isArray(listBody?.children) && listBody!.children!.length === 2, "column_list has two children");
   const colReq = listBody!.children![0]!;
   assert(colReq.type === "column", "child is a column");
   const colBody = (colReq as Record<string, unknown>).column as { children?: BlockRequest[] } | undefined;
   assert(Array.isArray(colBody?.children) && colBody!.children!.length === 1, "column has one child");
   assert(colBody!.children![0]!.type === "paragraph", "leaf is a paragraph");
+}
+
+// 10b) A column_list left with fewer than the two columns Notion requires is
+//      unwrapped rather than emitted as an invalid body. A bare `column` is not
+//      a valid top-level block either, so the flatten goes down to its contents.
+{
+  const inner = hydratedBlock("paragraph", { rich_text: [{ type: "text", text: { content: "lonely" } }] });
+  const column = hydratedBlock("column", {}, { children: [inner] });
+  const columnList = hydratedBlock("column_list", {}, { children: [column] });
+  const out = toBlockRequest(columnList);
+  assert(out?.type === "paragraph", "one-column column_list flattens to its contents, not an invalid column_list");
+  assert(out?.type !== "column", "and never emits a bare column");
 }
 
 // -----------------------------------------------------------------------------

@@ -14,8 +14,8 @@
 
 import type { NotionClient } from "../../notion/client";
 import type { ToolResult } from "../../mcp/types";
-import type { BlockRequest } from "../../notion/markdown/to-blocks";
-import { appendInChunks, cloneBlockForRequest, hydrateChildren, textErr, textOk } from "./shared";
+import { appendClonedTree, cloneBlockTree } from "../../notion/block-clone";
+import { TEMPLATE_CLONE_POLICY, hydrateChildren, textErr, textOk } from "./shared";
 
 export async function applyTemplateHandler(
   client: NotionClient,
@@ -26,18 +26,17 @@ export async function applyTemplateHandler(
     return textErr("apply_template requires a `template_id` string.");
   }
   const tree = await hydrateChildren(client, templateId);
-  const cloned: BlockRequest[] = [];
-  let skipped = 0;
-  for (const b of tree) {
-    const c = cloneBlockForRequest(b);
-    if (c) cloned.push(c);
-    else skipped++;
-  }
+  const cloned = cloneBlockTree(tree, TEMPLATE_CLONE_POLICY);
+  const skipped = tree.length - cloned.length;
   if (cloned.length === 0) {
     const note = skipped > 0 ? ` (${skipped} blocks skipped — child_page/child_database can't be cloned)` : "";
     return textErr(`Template ${templateId} has no clonable content${note}.`);
   }
-  await appendInChunks(client, pageId, cloned);
+  // appendClonedTree, not a bare append: Notion's request schema refuses to
+  // carry `children` past a fixed nesting depth, and refuses column_list/table
+  // deeper still. Anything the request body couldn't hold is appended as a
+  // follow-up call rather than silently dropped from the template.
+  await appendClonedTree(client, pageId, cloned, TEMPLATE_CLONE_POLICY);
   const note = skipped > 0 ? ` (skipped ${skipped} child_page/child_database references)` : "";
   return textOk(`Applied template ${templateId} — appended ${cloned.length} top-level blocks to page ${pageId}${note}.`);
 }
