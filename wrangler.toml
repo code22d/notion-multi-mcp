@@ -39,6 +39,26 @@ compatibility_flags = ["nodejs_compat"]
 # For the default workers.dev URL, leave this empty — the worker reads it from the request.
 PUBLIC_BASE_URL = ""
 
+# VALIDATE_BLOCK_BODIES — DEV ONLY. Leave it commented out for deploys.
+#
+# Set to "1" and every block-carrying request body (notion_create_pages'
+# children, and every appendBlockChildren) is checked against
+# src/notion/block-write-schema.ts before it is sent, and anything Notion's
+# write schema would reject is logged with its block path, type and the
+# specific violation. It LOGS ONLY — the request goes out either way, so a
+# wrong verdict from the validator can never break a working call.
+#
+# It exists because every test in this repo asserts against a stubbed `fetch`,
+# and a stub accepts bodies Notion refuses — which is how `tab: {}` shipped
+# green. Run it against a real workspace to close that gap:
+#
+#     VALIDATE_BLOCK_BODIES=1 npx wrangler dev
+#
+# then watch the wrangler console while exercising create/append tools. Or
+# uncomment the line below for the same effect in `wrangler dev` only — but do
+# NOT leave it uncommented when you `wrangler deploy`.
+# VALIDATE_BLOCK_BODIES = "1"
+
 [[kv_namespaces]]
 binding = "NOTION_MCP_KV"
 id = "8101642dc8ff4d33aa209b4e3f662143"

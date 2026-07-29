@@ -30,6 +30,7 @@ import type { NotionClient } from "../../notion/client";
 import type { ToolResult } from "../../mcp/types";
 import { blocksToMarkdown } from "../../notion/markdown/from-blocks";
 import { markdownToBlocks } from "../../notion/markdown/to-blocks";
+import { fitRequestTree, hasPendingWork } from "../../notion/block-clone";
 import { hydrateChildren, textErr, textOk } from "./shared";
 import { replaceBlockRange, replaceContentHandler } from "./replace";
 import { checkPreservation } from "./preservation";
@@ -161,6 +162,21 @@ async function executePlan(
       // fall back to the full path rather than do clever chunking.
       if (plan.insertBlocks.length > MEDIUM_PATH_INSERT_CAP) {
         return fullFallback(client, pageId, finalMd, existing, opts, "medium-path insertion exceeded 100 blocks");
+      }
+      // Same reasoning for depth. The medium path is one anchored append
+      // (`after:`), and appendClonedTree has no `after` — so a tree too deep
+      // for a single request body cannot be split here without losing the
+      // anchor. Hand it to the full path, which does handle deferral. Costs
+      // the id preservation this path exists for; the alternative is a 400.
+      if (hasPendingWork(fitRequestTree(plan.insertBlocks))) {
+        return fullFallback(
+          client,
+          pageId,
+          finalMd,
+          existing,
+          opts,
+          "medium-path insertion nested deeper than one request body can carry"
+        );
       }
       const { deleted, inserted } = await replaceBlockRange(
         client,

@@ -488,7 +488,15 @@ function tabIconAttribute(raw: unknown): string {
   }
 
   if (!value) return "";
-  return ` icon="${value.replace(/"/g, "&quot;")}"`;
+  // `&` MUST be escaped before `"`, and both must be escaped, because the read
+  // side (to-blocks.ts decodeHtmlAttr) decodes both. Escaping only `"` was a
+  // round-trip asymmetry: an icon URL containing a literal `&amp;` came back
+  // out as `&`, because nothing on this side had produced that sequence and the
+  // decoder could not tell "the author wrote &amp;" from "we escaped an &".
+  // Escaping `&` first makes the pair a true inverse — `&amp;` goes out as
+  // `&amp;amp;` and comes back as `&amp;`. Doing `"` first would double-escape
+  // the `&` we just introduced.
+  return ` icon="${value.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"`;
 }
 
 function renderColumnList(block: HydratedBlock, ctx: Ctx): string {

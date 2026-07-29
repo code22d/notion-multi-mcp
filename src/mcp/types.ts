@@ -12,6 +12,14 @@ export interface Env {
 
   // Vars
   PUBLIC_BASE_URL?: string;
+  /**
+   * DEV ONLY — set to "1"/"true" (typically in `wrangler dev`) to have the
+   * Notion client check block-carrying request bodies against
+   * notion/block-write-schema.ts and log what Notion would reject. It never
+   * throws and never suppresses the request; unset (the production default)
+   * it costs one boolean test per create/append. See NotionClient.checkBlockBody().
+   */
+  VALIDATE_BLOCK_BODIES?: string;
 }
 
 export interface ToolContext {

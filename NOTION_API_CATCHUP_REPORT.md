@@ -594,3 +594,78 @@ Everything added this session was written against `2025-09-03` shapes and
 should carry forward unchanged, with one thing to re-check: the views reference
 docs are written for `2026-03-11`, so if any view request/response shape
 differs between versions, the four new view tools are where it would show up.
+
+---
+
+## Correction note — 2026-07-28 (added later the same day)
+
+Appended, not edited in place: the report above is left exactly as written so
+the record of what was believed at the time survives. Three rows above are
+overstated. Each correction below is also written into the code, at the place
+the behaviour lives, so it is discoverable without this file.
+
+### 1. The refresh path is **implemented, unreachable until re-auth**
+
+Row **1.2 Refresh path (expiry + `unauthorized`)** is marked **done**, which
+reads as "working". The honest status is **implemented, unreachable until
+re-auth**.
+
+Neither branch can execute against any account currently in KV:
+
+- **Reactive** (`accounts/refresh.ts:refreshAccountToken`) returns `null` on its
+  first line when `account.refreshToken` is absent, and no account record
+  written before 2026-07 has one — Notion only began issuing refresh tokens to
+  public connections authorized after 2026-06-08. The report disclosed this for
+  the proactive branch only.
+- **Proactive** (`accounts/resolver.ts`) is gated on `isTokenExpired()`, which
+  answers `false` whenever `expiresAt` is absent — which it is for every one of
+  those same records.
+
+So the whole feature — `oauth/token.ts`'s refresh grant, `accounts/refresh.ts`,
+the `onUnauthorized` hook, and the 13-call-site `createNotionClient` refactor —
+is exercised only by its unit tests. That is not a defect: the requirement was
+that no existing account needs re-authorization, and it is met. But nobody
+should assume token recovery is live.
+
+**What makes it live:** re-authorize an account through `notion_account_add`
+against a Notion connection created or re-consented after 2026-06-08. From that
+account's next 401 onward, this code runs for real — for the first time ever,
+so it is worth watching.
+
+Recorded in the code at the head of `src/accounts/refresh.ts` and on the
+proactive branch in `src/accounts/resolver.ts`.
+
+### 2. §4.1's "3 for 5xx (unchanged)" is true of attempts, not of sleep
+
+The **attempt count** for 5xx is unchanged at 3. The **total sleep** is not: a
+persistent 5xx now sleeps 500ms (100 + 400) where it previously slept 1400ms
+(100 + 400 + 900).
+
+The old loop slept after its final attempt and then threw, so that last 900ms
+bought nothing — the request was already over. The new loop breaks before
+sleeping. Strictly an improvement, and one a Worker holding an MCP client's
+HTTP request open particularly wants, but it is a visible change in how long a
+hard failure takes to surface and it was not disclosed.
+
+Recorded at the `break` in `src/notion/client.ts`'s retry loop.
+
+### 3. `IN ()` with an empty list now errors; it used to emit `equals: []`
+
+Not mentioned in §4.3's multi-value filter design notes. `FILTER "Status" IN ()`
+now fails at parse time. It previously emitted `equals: []`, which Notion
+accepts and which then silently matches nothing (or, for `NOT IN`, everything).
+
+The new behaviour is better and is being kept: a view that renders, looks
+configured and quietly shows the wrong rows is the worst outcome available, and
+`IN ()` is never something a caller means. Erroring names the mistake before a
+single API call.
+
+Recorded on `requireList()` in `src/notion/view-dsl/emit.ts`.
+
+### Not corrected here
+
+Findings 1, 2, 4 and 6 of `NOTION_API_VERIFY_REPORT.md` are handled elsewhere:
+the 429 attempt policy was already changed to "5 attempts only when a
+`Retry-After` was present" (`client.ts`); Finding 2 (`notion_query_view` on
+`2025-09-03`) still needs one live call and is unchanged; Findings 4 and 6 are
+fixed in code and written up in `LEFTOVERS_FIX_REPORT.md`.

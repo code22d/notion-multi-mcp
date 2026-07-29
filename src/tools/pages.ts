@@ -8,6 +8,12 @@ import { ACCOUNT_PARAM_SCHEMA, resolveAccount, createNotionClient } from "../acc
 import { stripDashes, type NotionPageObject } from "../notion/client";
 import { richTextToPlain } from "../notion/markdown/rich-text";
 import { markdownToBlocks, type BlockRequest } from "../notion/markdown/to-blocks";
+import {
+  AUTHORED_CLONE_POLICY,
+  appendClonedTree,
+  fitRequestTree,
+  resolvePendingChildren,
+} from "../notion/block-clone";
 import { updatePageHandler, UPDATE_PAGE_INPUT_SCHEMA } from "./update-page";
 import {
   coerceScalarToPropertyValue,
@@ -127,21 +133,36 @@ async function createPagesHandler(args: Record<string, unknown>, ctx: ToolContex
     }
     try {
       const body = buildCreatePageBody(parent, spec, resolveType);
-      const firstBatch = body.children.slice(0, CHILDREN_PER_REQUEST);
-      const overflow = body.children.slice(CHILDREN_PER_REQUEST);
+
+      // Markdown has no nesting limit; Notion's request body does. Five nested
+      // <details> parse into five nested toggles, and a body that deep is a 400
+      // that loses the whole page — so fit the tree to the write schema first
+      // and let the parts that don't fit arrive as follow-up appends, exactly
+      // as duplicate_page and apply_template already do. Shallow content is
+      // unaffected: fitRequestTree returns it unchanged with nothing pending,
+      // and resolvePendingChildren then makes no API call at all.
+      const fitted = fitRequestTree(body.children);
+      const firstBatch = fitted.slice(0, CHILDREN_PER_REQUEST);
+      const overflow = fitted.slice(CHILDREN_PER_REQUEST);
 
       const page: NotionPageObject = await client.createPage({
         parent: body.parent,
         properties: body.properties,
         icon: body.icon,
         cover: body.cover,
-        children: firstBatch,
+        children: firstBatch.map((c) => c.request),
       });
 
-      // Append any overflow children in further chunks of 100.
-      for (let off = 0; off < overflow.length; off += CHILDREN_PER_REQUEST) {
-        const slice = overflow.slice(off, off + CHILDREN_PER_REQUEST);
-        await client.appendBlockChildren(page.id, { children: slice });
+      // Resolve the first batch's deferred subtrees BEFORE appending overflow:
+      // resolvePendingChildren pairs `fitted` against the page's children by
+      // index, which is only unambiguous while those are all the page holds.
+      await resolvePendingChildren(client, page.id, firstBatch, AUTHORED_CLONE_POLICY);
+
+      // Append any overflow children in further chunks of 100. appendClonedTree
+      // chunks internally and addresses the created blocks from the append
+      // response, so its own deferrals resolve without re-listing the page.
+      if (overflow.length > 0) {
+        await appendClonedTree(client, page.id, overflow, AUTHORED_CLONE_POLICY);
       }
 
       created.push({

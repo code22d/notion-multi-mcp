@@ -104,6 +104,49 @@ Once connected to Claude:
 
 To use it: just reference the name. "**Fetch the homepage from VirtualLatinos**" → Claude calls `notion_fetch({ account: "VirtualLatinos", id: "..." })`.
 
+## Local development
+
+```bash
+npm test          # full suite, no network
+npm run typecheck
+npx wrangler dev  # run the worker locally
+```
+
+### `VALIDATE_BLOCK_BODIES` — catching bad request bodies before Notion does
+
+Every test in this repo asserts against a **stubbed `fetch`**, and a stub accepts any
+body — including ones Notion rejects outright. That is how
+`{"type":"tab","tab":{}}` shipped with a green suite and 400'd in production.
+
+Setting `VALIDATE_BLOCK_BODIES=1` makes the Notion client check every
+block-carrying request body (`notion_create_pages`' `children`, and every
+`appendBlockChildren`) against [`src/notion/block-write-schema.ts`](./src/notion/block-write-schema.ts)
+*before sending it*, and log anything the write schema would reject:
+
+```bash
+VALIDATE_BLOCK_BODIES=1 npx wrangler dev
+```
+
+Then exercise the create/append tools against a real workspace and watch the
+wrangler console:
+
+```
+[notion-multi-mcp] VALIDATE_BLOCK_BODIES: createPage would send 1 block(s) Notion's
+write schema rejects. Sending anyway.
+  children[1]: `tab.children` is required by the write schema but is absent
+```
+
+Three things to know about it:
+
+- **It logs, it never throws.** The request is sent regardless. The validator is a
+  transcription of Notion's generated request types, not the server; a wrong verdict
+  must cost a log line and nothing else.
+- **It is off by default.** Unset, the cost is one boolean test per create/append and
+  request bodies are byte-identical to what they'd otherwise be. Don't set it in
+  `wrangler.toml` for a deploy.
+- **It logs block paths, types and violations — never payloads.** No page text, no
+  URLs, no icons, no token material.
+
 ## Architecture
 
 ```

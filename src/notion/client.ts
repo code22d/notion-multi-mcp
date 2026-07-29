@@ -5,6 +5,7 @@
 // -----------------------------------------------------------------------------
 
 import type { NotionAccount } from "../mcp/types";
+import { describeBlockRequestProblems, validateBlockRequestTree } from "./block-write-schema";
 
 const NOTION_API = "https://api.notion.com/v1";
 export const NOTION_VERSION = "2025-09-03";
@@ -64,6 +65,14 @@ export interface NotionClientOptions {
    * in tests and in any call site that doesn't have an Env to refresh against.
    */
   onUnauthorized?: () => Promise<string | null>;
+  /**
+   * Dev-only: check block-carrying request bodies against the write schema and
+   * LOG what Notion would reject. Off unless VALIDATE_BLOCK_BODIES is set —
+   * see validateBlockBodiesEnabled() and checkBlockBody() below.
+   */
+  validateBlockBodies?: boolean;
+  /** Injectable log sink for the above. Defaults to console.warn. */
+  logImpl?: (message: string) => void;
 }
 
 export class NotionClient {
@@ -71,12 +80,70 @@ export class NotionClient {
   private readonly sleepImpl: (ms: number) => Promise<void>;
   private readonly nowImpl: () => number;
   private readonly onUnauthorized: (() => Promise<string | null>) | undefined;
+  private readonly validateBlockBodies: boolean;
+  private readonly logImpl: ((message: string) => void) | undefined;
 
   constructor(private readonly account: NotionAccount, opts: NotionClientOptions = {}) {
     this.fetchImpl = opts.fetchImpl ?? ((input, init) => fetch(input as RequestInfo, init));
     this.sleepImpl = opts.sleepImpl ?? sleep;
     this.nowImpl = opts.nowImpl ?? (() => Date.now());
     this.onUnauthorized = opts.onUnauthorized;
+    this.validateBlockBodies = opts.validateBlockBodies === true;
+    this.logImpl = opts.logImpl;
+  }
+
+  // -------------------------------------------------------------------
+  // Dev-only request-body validation
+  //
+  // WHY THIS EXISTS
+  //
+  // Every test in this repo asserts against a stubbed `fetch`, and a stub
+  // accepts any body Notion would reject. That blind spot is how
+  // `{"type":"tab","tab":{}}` shipped green and 400'd in production. This hook
+  // runs block-write-schema.ts's validator over the bodies we are about to
+  // send, so `wrangler dev` against a real workspace catches the class the
+  // suite structurally cannot.
+  //
+  // THREE RULES, IN ORDER OF IMPORTANCE
+  //
+  // 1. It LOGS, it never throws, and the request is sent either way. The
+  //    validator is a transcription of generated types, not the server; if it
+  //    is wrong, a false positive must cost a log line and nothing else. Even
+  //    an exception thrown *inside* the validator is swallowed — a diagnostic
+  //    has no business failing a working request.
+  // 2. It is OFF unless the flag is set. When off, the only cost is one boolean
+  //    test per create/append call and production bodies are byte-identical to
+  //    what they were before this existed. Nothing here mutates `body`.
+  // 3. It logs the block PATH, TYPE and VIOLATION — never the payload. The
+  //    validator's messages are built from block type names, field names and
+  //    tier numbers, so page text, URLs, icons and (above all) tokens cannot
+  //    reach the log. Anything added to those messages later must keep that
+  //    property.
+  // -------------------------------------------------------------------
+
+  /** Cap the log so a badly-formed 100-block body can't bury everything else. */
+  private static readonly MAX_LOGGED_PROBLEMS = 20;
+
+  private checkBlockBody(operation: string, body: unknown): void {
+    if (!this.validateBlockBodies) return;
+    try {
+      const children = (body as { children?: unknown } | null | undefined)?.children;
+      if (children === undefined) return;
+      const problems = validateBlockRequestTree(children);
+      if (problems.length === 0) return;
+      const shown = problems.slice(0, NotionClient.MAX_LOGGED_PROBLEMS);
+      const more =
+        problems.length > shown.length ? `\n  … and ${problems.length - shown.length} more` : "";
+      const log = this.logImpl ?? ((m: string) => console.warn(m));
+      log(
+        `[notion-multi-mcp] VALIDATE_BLOCK_BODIES: ${operation} would send ${problems.length} ` +
+          `block(s) Notion's write schema rejects. Sending anyway.\n  ` +
+          describeBlockRequestProblems(shown).split("\n").join("\n  ") +
+          more
+      );
+    } catch {
+      /* A diagnostic must never be the reason a request fails. */
+    }
   }
 
   // -------------------------------------------------------------------
@@ -171,6 +238,18 @@ export class NotionClient {
       // spending extra requests against a limit we're already over.
       const attemptsAllowed =
         isRateLimited && advertised !== null ? MAX_ATTEMPTS_RETRY_AFTER : MAX_ATTEMPTS_DEFAULT;
+      // Break BEFORE sleeping, not after. The pre-2026-07 loop slept on its
+      // final attempt and then threw, so a persistent 5xx cost 100+400+900 =
+      // 1400ms of wall clock, 900ms of which bought nothing — the request was
+      // already over. Breaking here makes that 100+400 = 500ms.
+      //
+      // BEHAVIOUR CHANGE (2026-07-28, undocumented at the time): the ATTEMPT
+      // count for 5xx is unchanged at 3, which is what the catch-up report
+      // meant by "unchanged"; the total sleep is not. It is strictly an
+      // improvement — a Worker holding the MCP client's HTTP request open has
+      // no reason to sleep after deciding to give up — but it is a visible
+      // difference in how long a hard failure takes to surface, so it belongs
+      // in writing rather than in the diff only.
       if (attempt >= attemptsAllowed) break;
 
       // Prefer Notion's advertised delay; fall back to the original
@@ -294,6 +373,7 @@ export class NotionClient {
 
   /** POST /v1/pages */
   createPage(body: unknown): Promise<NotionPageObject> {
+    this.checkBlockBody("createPage", body);
     return this.request<NotionPageObject>(`/pages`, { method: "POST", body });
   }
 
@@ -318,6 +398,7 @@ export class NotionClient {
 
   /** POST /v1/blocks/{parent_id}/children — append. */
   appendBlockChildren(blockId: string, body: unknown): Promise<PaginatedList<NotionBlockObject>> {
+    this.checkBlockBody("appendBlockChildren", body);
     return this.request<PaginatedList<NotionBlockObject>>(`/blocks/${stripDashes(blockId)}/children`, {
       method: "PATCH",
       body,
@@ -950,6 +1031,29 @@ export type NotionCover =
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/**
+ * Is the dev-only block-body validator switched on?
+ *
+ * Deliberately opt-IN and deliberately strict about what counts as on: the
+ * default for anything unset, empty, misspelled or ambiguous is `false`, so a
+ * typo in `wrangler.toml` leaves production exactly as it is today rather than
+ * quietly enabling a diagnostic. `"0"` and `"false"` are accepted spellings of
+ * off for the same reason — they are what people write when they mean off.
+ */
+export function validateBlockBodiesEnabled(raw: unknown): boolean {
+  if (typeof raw === "boolean") return raw;
+  if (typeof raw !== "string") return false;
+  switch (raw.trim().toLowerCase()) {
+    case "1":
+    case "true":
+    case "yes":
+    case "on":
+      return true;
+    default:
+      return false;
+  }
 }
 
 /**

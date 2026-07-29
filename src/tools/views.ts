@@ -73,7 +73,7 @@ export function registerViewTools(register: (def: ToolDef) => void): void {
       type: "object",
       properties: {
         ...ACCOUNT_PARAM_SCHEMA,
-        view_id: { type: "string" },
+        view_id: { type: "string", description: "The view id (or a Notion URL containing ?v=<view id>)." },
         name: { type: "string" },
         configure: { type: "string" },
       },
@@ -260,8 +260,12 @@ async function updateViewHandler(args: Record<string, unknown>, ctx: ToolContext
   const account = await resolveAccount(args, ctx);
   const client = createNotionClient(account, ctx);
 
-  const viewId = typeof args.view_id === "string" ? args.view_id.trim() : "";
-  if (!viewId) return textErr("`view_id` is required.");
+  const rawViewId = typeof args.view_id === "string" ? args.view_id.trim() : "";
+  if (!rawViewId) return textErr("`view_id` is required.");
+  // Same acceptance as notion_get_view / _delete_view / _query_view. Without
+  // this, pasting a Notion URL worked in one tool and 400'd in this one, which
+  // reads as "update is broken" rather than "wrong id format".
+  const viewId = parseViewId(rawViewId);
 
   const name = typeof args.name === "string" ? args.name : undefined;
   const configure = typeof args.configure === "string" ? args.configure : "";

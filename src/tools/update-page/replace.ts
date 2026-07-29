@@ -20,7 +20,12 @@ import type { NotionClient } from "../../notion/client";
 import type { HydratedBlock } from "../../notion/markdown/from-blocks";
 import type { ToolResult } from "../../mcp/types";
 import { markdownToBlocks, type BlockRequest } from "../../notion/markdown/to-blocks";
-import { appendInChunks, hydrateChildren, textErr, textOk } from "./shared";
+import { hydrateChildren, textErr, textOk } from "./shared";
+import {
+  AUTHORED_CLONE_POLICY,
+  appendClonedTree,
+  fitRequestTree,
+} from "../../notion/block-clone";
 import { checkPreservation } from "./preservation";
 
 /**
@@ -99,7 +104,11 @@ export async function replaceContentHandler(
     }
   }
 
-  await appendInChunks(client, pageId, newBlocks);
+  // Same write-schema fitting the create path does: markdown can nest deeper
+  // than Notion's request body accepts, and appendClonedTree sends the surplus
+  // as follow-up requests instead of losing it to a 400. Shallow content emits
+  // exactly the same bodies appendInChunks did, in the same chunks.
+  await appendClonedTree(client, pageId, fitRequestTree(newBlocks), AUTHORED_CLONE_POLICY);
 
   return textOk(
     `Replaced page ${pageId} content — deleted ${deleted} existing block${deleted === 1 ? "" : "s"}, appended ${newBlocks.length} new block${newBlocks.length === 1 ? "" : "s"}.`

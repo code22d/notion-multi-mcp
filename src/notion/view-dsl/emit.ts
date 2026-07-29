@@ -552,7 +552,19 @@ function requirePersonValue(v: FilterValue | undefined, label: string): string {
   return requireString(v, label);
 }
 
-/** A multi-value operand for IN / NOT IN. */
+/**
+ * A multi-value operand for IN / NOT IN.
+ *
+ * BEHAVIOUR CHANGE (2026-07-28, undocumented at the time): an empty list —
+ * `FILTER "Status" IN ()` — is now an error. It previously emitted
+ * `equals: []`, which Notion accepts and which then silently matches nothing
+ * (or, for NOT IN, everything). That is the worst possible outcome for a
+ * filter: the view renders, looks configured, and quietly shows the wrong
+ * rows. `IN ()` is never something a caller means, so the only useful reading
+ * of it is a mistake in the DSL they wrote — and a parse-time error names it
+ * before a single API call, where a silently-empty view would have to be
+ * noticed by eye.
+ */
 function requireList(v: FilterValue | undefined, label: string): string[] {
   if (!v || v.kind !== "list") throw new EmitError(`${label} requires a parenthesised list, e.g. ${label} ("a", "b")`);
   if (v.values.length === 0) throw new EmitError(`${label} requires at least one value`);

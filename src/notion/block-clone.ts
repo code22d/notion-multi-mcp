@@ -39,6 +39,23 @@ import {
 export const CHILDREN_PER_REQUEST = 100;
 
 /**
+ * The minimum a source block needs to go through this engine: a `type`, a body
+ * object under that key, and its children lifted to a top-level `children`.
+ *
+ * `HydratedBlock` satisfies it directly. So does a REQUEST-shape block once
+ * liftRequestChildren() has moved `block[type].children` up to `block.children`
+ * — which is how markdownToBlocks output reaches the same tier-fitting and
+ * deferral logic as a cloned page, instead of a second implementation of it.
+ * Nothing here reads `id`/`object`, so requiring them would only force callers
+ * to invent values.
+ */
+export interface CloneSource {
+  type?: string;
+  children?: CloneSource[];
+  [key: string]: unknown;
+}
+
+/**
  * Why a source block could not be turned into a request block at all. The
  * caller decides whether that becomes a visible placeholder or a silent skip.
  */
@@ -52,7 +69,7 @@ export type UnclonableKind =
 
 export interface ClonePolicy {
   /** Substitute request for an unclonable block, or null to drop it. */
-  substitute(block: HydratedBlock, kind: UnclonableKind): BlockRequest | null;
+  substitute(block: CloneSource, kind: UnclonableKind): BlockRequest | null;
   /**
    * What to do with a synced_block that MIRRORS another block.
    *
@@ -74,7 +91,7 @@ export interface ClonedBlock {
    * Source children that would not fit inline at this tier. The caller appends
    * them under this block once it exists — see resolvePendingChildren().
    */
-  pending?: HydratedBlock[];
+  pending?: CloneSource[];
   /** Clone results for children that WERE inlined, index-aligned with them. */
   inlined?: ClonedBlock[];
 }
@@ -133,7 +150,7 @@ function rewriteHostedMedia(body: Record<string, unknown>, type: string): void {
  * internal consequence of inlining.
  */
 export function cloneBlockTree(
-  blocks: HydratedBlock[],
+  blocks: CloneSource[],
   policy: ClonePolicy,
   tier = 1
 ): ClonedBlock[] {
@@ -157,7 +174,7 @@ export function cloneBlockTree(
  * cannot be expressed at this tier, otherwise the request plus whatever still
  * needs appending afterwards.
  */
-function cloneOne(block: HydratedBlock, policy: ClonePolicy, tier: number): Outcome {
+function cloneOne(block: CloneSource, policy: ClonePolicy, tier: number): Outcome {
   const type = block.type;
   if (!type) return null;
 
@@ -230,12 +247,12 @@ function cloneOne(block: HydratedBlock, policy: ClonePolicy, tier: number): Outc
 }
 
 function cloneMany(
-  blocks: HydratedBlock[],
+  blocks: CloneSource[],
   policy: ClonePolicy,
   tier: number
-): { inlined: ClonedBlock[]; deferred: HydratedBlock[] } {
+): { inlined: ClonedBlock[]; deferred: CloneSource[] } {
   const inlined: ClonedBlock[] = [];
-  const deferred: HydratedBlock[] = [];
+  const deferred: CloneSource[] = [];
   for (const block of blocks) {
     const outcome = cloneOne(block, policy, tier);
     if (outcome === DEFER) deferred.push(block);
@@ -251,7 +268,7 @@ function cloneMany(
  * surprise child type degrades to "one block missing" instead of a 400 that
  * takes the entire page with it.
  */
-function childrenFor(block: HydratedBlock, type: string): HydratedBlock[] {
+function childrenFor(block: CloneSource, type: string): CloneSource[] {
   const kids = block.children ?? [];
   const allowed = blockWriteRule(type).childTypes;
   if (!allowed) return kids;
@@ -263,7 +280,7 @@ function childrenFor(block: HydratedBlock, type: string): HydratedBlock[] {
  * outside a `column_list` is not a valid block, so a discarded column_list
  * flattens to its columns' contents rather than to the columns themselves.
  */
-function unwrapForFlatten(block: HydratedBlock): HydratedBlock[] {
+function unwrapForFlatten(block: CloneSource): CloneSource[] {
   const kids = block.children ?? [];
   return kids.flatMap((k) => (k.type === "column" ? k.children ?? [] : [k]));
 }
@@ -271,6 +288,68 @@ function unwrapForFlatten(block: HydratedBlock): HydratedBlock[] {
 function fromSubstitute(request: BlockRequest | null): ClonedBlock | null {
   return request ? { request } : null;
 }
+
+// -----------------------------------------------------------------------------
+// Request-shape input — the CREATE path
+// -----------------------------------------------------------------------------
+
+/**
+ * Fitting a tree we AUTHORED needs no policy: markdownToBlocks only emits types
+ * the write schema has a create shape for, never a child_page, and never a
+ * synced_block reference. Both fields are here because the engine's signature
+ * demands them, not because either branch can be reached.
+ */
+export const AUTHORED_CLONE_POLICY: ClonePolicy = {
+  substitute: () => null,
+  syncedReference: "keep-link",
+};
+
+/**
+ * Move `block[type].children` up to `block.children`, recursively.
+ *
+ * Request-shape blocks nest children INSIDE the type body; the clone engine
+ * expects them alongside it (that is the shape Notion's read responses have,
+ * hydrated). Lifting is all that separates the two, so lifting is all it takes
+ * for authored markdown to reuse the tier-fitting and deferral logic that
+ * duplicate_page and apply_template already rely on.
+ *
+ * Non-mutating: the caller's array and every block in it are left untouched,
+ * because markdownToBlocks output is also handed to the update-page diff
+ * planner, which compares it against a separate rendering.
+ */
+export function liftRequestChildren(blocks: BlockRequest[]): CloneSource[] {
+  return blocks.map((block) => {
+    const type = typeof block.type === "string" ? block.type : undefined;
+    const body = type ? (block as Record<string, unknown>)[type] : undefined;
+    const kids =
+      body && typeof body === "object" && !Array.isArray(body)
+        ? (body as Record<string, unknown>).children
+        : undefined;
+    if (!Array.isArray(kids)) return block as CloneSource;
+    return {
+      ...(block as Record<string, unknown>),
+      children: liftRequestChildren(kids as BlockRequest[]),
+    } as CloneSource;
+  });
+}
+
+/**
+ * Fit an authored (request-shape) block tree to Notion's write schema.
+ *
+ * markdownToBlocks happily emits five nested toggles, because Markdown has no
+ * depth limit. Notion's request body does: past tier 3 nothing carries children
+ * at all, and `column_list` stops being legal after tier 1. Sending such a body
+ * is a 400 that takes the whole page with it.
+ *
+ * The returned ClonedBlock[] carries the same `pending` records the clone path
+ * uses, so the caller finishes with resolvePendingChildren() (after a create)
+ * or appendClonedTree() (after an append) and the over-deep subtrees arrive in
+ * follow-up requests, starting again at tier 1.
+ */
+export function fitRequestTree(blocks: BlockRequest[]): ClonedBlock[] {
+  return cloneBlockTree(liftRequestChildren(blocks), AUTHORED_CLONE_POLICY);
+}
+
 
 // -----------------------------------------------------------------------------
 // Appending — resolving whatever the request body couldn't carry

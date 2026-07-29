@@ -70,13 +70,23 @@ export function markdownToBlocks(markdown: string): BlockRequest[] {
       });
       continue;
     }
-    if (part.kind === "details_block") {
-      const summaryTokens = mdLexer
-        .lexer(part.summary || " ")
-        .flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
-      const body: Record<string, unknown> = { rich_text: toRichText(summaryTokens) };
-      if (part.body && part.body.trim() !== "") body.children = markdownToBlocks(part.body);
-      out.push({ type: "toggle", toggle: body });
+    if (part.kind === "container_block") {
+      // The pre-processor only carves out the SPAN; tryHtmlBlock owns the
+      // parsing, so there is exactly one implementation of each container
+      // syntax rather than one here and a second one for the tokens marked
+      // hands back.
+      const blocks = tryHtmlBlock(part.raw);
+      if (blocks) {
+        out.push(...blocks);
+        continue;
+      }
+      // A balanced span we could not parse (e.g. <details> with no <summary>).
+      // Lex it directly rather than recursing through splitSpecialBlocks —
+      // that would re-extract the same span forever — so it degrades to the
+      // literal-text paragraph it produced before this pass existed.
+      for (const tok of mdLexer.lexer(part.raw) as TokensList) {
+        out.push(...tokenToBlocks(tok));
+      }
       continue;
     }
     if (part.kind === "markdown") {
@@ -91,24 +101,46 @@ export function markdownToBlocks(markdown: string): BlockRequest[] {
 }
 
 // -----------------------------------------------------------------------------
-// Pre-processing: extract block equations `$$ … $$` and <details>…</details>
-// spans out-of-band before lex. Both are multi-line constructs that marked's
-// default paragraph rule tends to split across multiple tokens, so grabbing
-// them in one pass up-front gives us a single contiguous string for each.
+// Pre-processing: extract block equations `$$ … $$` and the HTML-ish container
+// blocks (<details>, <tabs>, <column-list>) out-of-band before lex. All are
+// multi-line constructs that marked's default paragraph rule tends to split
+// across multiple tokens, so grabbing them in one pass up-front gives us a
+// single contiguous string for each.
+//
+// WHY THIS PASS IS TAG-BALANCED AND NOT A REGEX
+//
+// Every one of these containers used to be found with a non-greedy
+// `([\s\S]*?)</tag>` regex. Non-greedy means "stop at the FIRST closer", which
+// is precisely wrong for a construct that nests: given five nested <details>,
+// the outer one closed at the innermost `</details>`, the four inner openers
+// were swallowed as literal text inside the toggle, and the four surplus
+// `</details>` closers leaked out as a visible paragraph. Same shape for
+// <tabs>/<tab> and <column-list>/<column>. That is silent mangling of valid
+// input, so the scan counts depth instead — see findMatchingClose().
+//
+// The pass also stops at the OUTERMOST container rather than descending. A
+// <details> inside a <tab> used to be ripped out from under it here, leaving
+// the surrounding <tabs>/<tab> tags stranded as text. Now the whole <tabs> span
+// leaves as one segment and its bodies are parsed by recursion, so a container
+// is only ever interpreted by the parser that owns its context.
 // -----------------------------------------------------------------------------
 
 type Segment =
   | { kind: "markdown"; text: string }
   | { kind: "equation_block"; expression: string }
-  | { kind: "details_block"; summary: string; body: string };
+  /** A balanced <details>/<tabs>/<column-list> span, verbatim. */
+  | { kind: "container_block"; raw: string };
+
+/** Block-level containers the pre-processor carves out whole. */
+const CONTAINER_TAGS = ["details", "tabs", "column-list"] as const;
 
 function splitSpecialBlocks(source: string): Segment[] {
-  // First pass — extract <details>…</details> spans. These can straddle blank
-  // lines, which marked would otherwise tokenise as separate paragraphs.
-  const afterDetails = splitOnDetails(source);
+  // First pass — extract container spans. These can straddle blank lines,
+  // which marked would otherwise tokenise as separate paragraphs.
+  const afterContainers = splitOnContainers(source);
   // Second pass — within each `markdown`-kind segment, extract $$…$$ blocks.
   const segments: Segment[] = [];
-  for (const seg of afterDetails) {
+  for (const seg of afterContainers) {
     if (seg.kind !== "markdown") {
       segments.push(seg);
       continue;
@@ -119,22 +151,62 @@ function splitSpecialBlocks(source: string): Segment[] {
   return segments;
 }
 
-function splitOnDetails(source: string): Segment[] {
-  // Match <details>[whitespace-tolerant]<summary>…</summary> … </details>
-  // across any number of intervening newlines / blank lines. Non-greedy on
-  // the body so nested <details> don't swallow the outer closer.
-  // Leading whitespace (incl. one or more spaces at line start) is allowed.
-  const re = /(^|\n)[ \t]*<details>\s*<summary>([\s\S]*?)<\/summary>([\s\S]*?)<\/details>[ \t]*(?=\n|$)/gi;
+/**
+ * Index of the `</tag>` that balances an opener whose body starts at `from`.
+ *
+ * Depth starts at 1 — the caller has already consumed the opening tag — and
+ * every further `<tag …>` raises it, so nested containers close in the right
+ * order. Returns null when the source never balances, which the callers treat
+ * as "this isn't a container after all" rather than guessing.
+ *
+ * The tag patterns are deliberately exact about word boundaries: `<tab>` must
+ * not match `<tabs>` and `<column>` must not match `<column-list>`, or a nested
+ * <tabs> inside a <tab> would miscount depth in both directions.
+ */
+function findMatchingClose(
+  source: string,
+  tag: string,
+  from: number
+): { innerEnd: number; end: number } | null {
+  const re = new RegExp(`<${tag}(?:\\s[^>]*)?>|</${tag}\\s*>`, "gi");
+  re.lastIndex = from;
+  let depth = 1;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(source))) {
+    if (m[0]!.startsWith("</")) {
+      depth--;
+      if (depth === 0) return { innerEnd: m.index, end: m.index + m[0]!.length };
+    } else {
+      depth++;
+    }
+  }
+  return null;
+}
+
+function splitOnContainers(source: string): Segment[] {
+  // An opener has to start its own line (leading whitespace allowed), which is
+  // the rule the old <details> pass used — an inline <details> in running prose
+  // stays prose.
+  const openRe = new RegExp(`(^|\\n)([ \\t]*)<(${CONTAINER_TAGS.join("|")})(?:\\s[^>]*)?>`, "gi");
   const segments: Segment[] = [];
   let last = 0;
   let m: RegExpExecArray | null;
-  while ((m = re.exec(source))) {
-    const before = source.slice(last, m.index + m[1]!.length);
+  while ((m = openRe.exec(source))) {
+    const tag = m[3]!.toLowerCase();
+    const spanStart = m.index + m[1]!.length;
+    const close = findMatchingClose(source, tag, m.index + m[0]!.length);
+    // Unbalanced, or something other than whitespace follows the closer on its
+    // line: not a block-level container. Leave it to marked and resume the
+    // scan after the opener so a later, well-formed container still lands.
+    if (!close || !/^[ \t]*(\n|$)/.test(source.slice(close.end))) {
+      openRe.lastIndex = m.index + m[0]!.length;
+      continue;
+    }
+    const before = source.slice(last, spanStart);
     if (before.trim() !== "") segments.push({ kind: "markdown", text: before });
-    const summary = (m[2] ?? "").trim();
-    const body = (m[3] ?? "").trim();
-    segments.push({ kind: "details_block", summary, body });
-    last = m.index + m[0].length;
+    segments.push({ kind: "container_block", raw: source.slice(spanStart, close.end) });
+    last = close.end;
+    openRe.lastIndex = close.end;
   }
   const rest = source.slice(last);
   if (rest.trim() !== "") segments.push({ kind: "markdown", text: rest });
@@ -395,6 +467,47 @@ function tableBlock(t: Tokens.Table): BlockRequest {
 // HTML-block extensions: <details>, <column-list>/<column>, standalone tags.
 // -----------------------------------------------------------------------------
 
+/**
+ * `raw` is exactly one balanced `<tag>…</tag>` and nothing else → its inner
+ * text. Returns null when the tag never closes, or when content follows the
+ * closer — both mean this isn't a standalone container block and the caller
+ * should fall through to whatever it tries next.
+ */
+function parseContainer(raw: string, tag: string, openLength: number): { inner: string } | null {
+  const close = findMatchingClose(raw, tag, openLength);
+  if (!close) return null;
+  if (raw.slice(close.end).trim() !== "") return null;
+  return { inner: raw.slice(openLength, close.innerEnd) };
+}
+
+/**
+ * Walk the direct `<item>…</item>` children of a container body, skipping any
+ * that belong to a nested container of the same family.
+ *
+ * Depth-balanced per item, which is the whole point: the previous
+ * `<item>([\s\S]*?)</item>` scan closed each item at the first `</item>` it
+ * saw, so an item containing a nested container ended early and the nested
+ * container's items were promoted to siblings.
+ */
+function scanContainerItems(
+  body: string,
+  tag: string
+): Array<{ attrs: string; inner: string }> {
+  const openRe = new RegExp(`<${tag}(\\s[^>]*)?>`, "gi");
+  const items: Array<{ attrs: string; inner: string }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = openRe.exec(body))) {
+    const close = findMatchingClose(body, tag, m.index + m[0]!.length);
+    if (!close) break;
+    items.push({
+      attrs: m[1] ?? "",
+      inner: body.slice(m.index + m[0]!.length, close.innerEnd).trim(),
+    });
+    openRe.lastIndex = close.end;
+  }
+  return items;
+}
+
 function tryHtmlBlock(raw: string): BlockRequest[] | null {
   const trimmed = raw.trim();
   if (!trimmed.startsWith("<")) return null;
@@ -403,21 +516,36 @@ function tryHtmlBlock(raw: string): BlockRequest[] | null {
   // It carries no round-trip-able content yet, so drop it silently.
   if (/^<caption>[\s\S]*?<\/caption>\s*$/i.test(trimmed)) return [];
 
-  // <details>…</details> → toggle
-  const detailsMatch = trimmed.match(
-    /^<details>\s*<summary>([\s\S]*?)<\/summary>\s*([\s\S]*?)\s*<\/details>\s*$/i
-  );
-  if (detailsMatch) {
-    const summaryMd = detailsMatch[1] ?? "";
-    const bodyMd = (detailsMatch[2] ?? "").trim();
-    const summaryTokens = mdLexer.lexer(summaryMd).flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
-    const body: Record<string, unknown> = { rich_text: toRichText(summaryTokens) };
-    if (bodyMd) body.children = markdownToBlocks(bodyMd);
-    return [{ type: "toggle", toggle: body }];
+  // <details><summary>…</summary> … </details> → toggle.
+  //
+  // Nesting is handled by taking the BALANCED closer and then recursing on the
+  // body: a toggle inside a toggle is just markdownToBlocks() run again. The
+  // old non-greedy regex stopped at the first `</details>`, which turned five
+  // nested toggles into one toggle plus four lines of visible closing tags.
+  const detailsOpen = /^<details(?:\s[^>]*)?>/i.exec(trimmed);
+  if (detailsOpen) {
+    const parsed = parseContainer(trimmed, "details", detailsOpen[0].length);
+    if (parsed) {
+      const summaryOpen = /^\s*<summary(?:\s[^>]*)?>/i.exec(parsed.inner);
+      if (summaryOpen) {
+        const summaryClose = findMatchingClose(parsed.inner, "summary", summaryOpen[0].length);
+        if (summaryClose) {
+          const summaryMd = parsed.inner.slice(summaryOpen[0].length, summaryClose.innerEnd);
+          const bodyMd = parsed.inner.slice(summaryClose.end).trim();
+          const summaryTokens = mdLexer.lexer(summaryMd).flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
+          const body: Record<string, unknown> = { rich_text: toRichText(summaryTokens) };
+          if (bodyMd) body.children = markdownToBlocks(bodyMd);
+          return [{ type: "toggle", toggle: body }];
+        }
+      }
+    }
   }
 
-  // Undo the minimal attribute escaping tabIconAttribute() applies on the way
-  // out, so an icon containing a quote round-trips.
+  // Undo the attribute escaping tabIconAttribute() applies on the way out, so
+  // an icon containing a quote or an ampersand round-trips. Order is the exact
+  // reverse of the encoder's (`&` then `"`): decoding `&amp;` first would turn
+  // an encoded `&amp;quot;` into `&quot;` and then into a `"` that was never
+  // there.
   const decodeHtmlAttr = (s: string): string =>
     s.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
 
@@ -428,48 +556,58 @@ function tryHtmlBlock(raw: string): BlockRequest[] | null {
   // `children` the tab's content. So each <tab> here becomes one paragraph,
   // NOT a block of its own — getting that inverted produces a 400 that reads
   // like an unrelated schema error.
-  const tabsMatch = trimmed.match(/^<tabs>\s*([\s\S]*?)\s*<\/tabs>\s*$/i);
-  if (tabsMatch) {
-    const inside = tabsMatch[1] ?? "";
-    const tabRe = /<tab(\s[^>]*)?>\s*<summary>([\s\S]*?)<\/summary>\s*([\s\S]*?)\s*<\/tab>/gi;
-    const tabs: BlockRequest[] = [];
-    let tm: RegExpExecArray | null;
-    while ((tm = tabRe.exec(inside))) {
-      const attrs = tm[1] ?? "";
-      const labelMd = tm[2] ?? "";
-      const bodyMd = (tm[3] ?? "").trim();
-      const labelTokens = mdLexer.lexer(labelMd).flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
-      const paragraph: Record<string, unknown> = { rich_text: toRichText(labelTokens) };
-      const iconRaw = /\bicon="([^"]*)"/i.exec(attrs)?.[1];
-      if (iconRaw) {
-        const icon = normalizeIconInput(decodeHtmlAttr(iconRaw));
-        // normalizeIconInput returns null for ""/"none"; a tab with no icon
-        // should simply omit the key rather than send an explicit null.
-        if (icon) paragraph.icon = icon;
+  const tabsOpen = /^<tabs(?:\s[^>]*)?>/i.exec(trimmed);
+  if (tabsOpen) {
+    const parsed = parseContainer(trimmed, "tabs", tabsOpen[0].length);
+    if (parsed) {
+      const tabs: BlockRequest[] = [];
+      // Balanced per item, so a <tabs> nested inside a <tab> body closes its own
+      // <tab>s rather than the outer one's. The item scan never sees the nested
+      // <tabs>/</tabs> at all — those tags don't match the <tab> patterns — and
+      // the nested item tags balance out within the outer body.
+      for (const item of scanContainerItems(parsed.inner, "tab")) {
+        const labelOpen = /^\s*<summary(?:\s[^>]*)?>/i.exec(item.inner);
+        if (!labelOpen) continue;
+        const labelClose = findMatchingClose(item.inner, "summary", labelOpen[0].length);
+        if (!labelClose) continue;
+        const labelMd = item.inner.slice(labelOpen[0].length, labelClose.innerEnd);
+        const bodyMd = item.inner.slice(labelClose.end).trim();
+        const labelTokens = mdLexer.lexer(labelMd).flatMap((t) => ((t as Tokens.Paragraph).tokens ?? []));
+        const paragraph: Record<string, unknown> = { rich_text: toRichText(labelTokens) };
+        const iconRaw = /\bicon="([^"]*)"/i.exec(item.attrs)?.[1];
+        if (iconRaw) {
+          const icon = normalizeIconInput(decodeHtmlAttr(iconRaw));
+          // normalizeIconInput returns null for ""/"none"; a tab with no icon
+          // should simply omit the key rather than send an explicit null.
+          if (icon) paragraph.icon = icon;
+        }
+        if (bodyMd) paragraph.children = markdownToBlocks(bodyMd);
+        tabs.push({ type: "paragraph", paragraph });
       }
-      if (bodyMd) paragraph.children = markdownToBlocks(bodyMd);
-      tabs.push({ type: "paragraph", paragraph });
+      if (tabs.length === 0) return null;
+      return [{ type: "tab", tab: { children: tabs } }];
     }
-    if (tabs.length === 0) return null;
-    return [{ type: "tab", tab: { children: tabs } }];
   }
 
   // <column-list>…</column-list> → column_list with nested columns
-  const colListMatch = trimmed.match(/^<column-list>\s*([\s\S]*?)\s*<\/column-list>\s*$/i);
-  if (colListMatch) {
-    const inside = colListMatch[1] ?? "";
-    const colRe = /<column>\s*([\s\S]*?)\s*<\/column>/gi;
-    const columns: BlockRequest[] = [];
-    let cm: RegExpExecArray | null;
-    while ((cm = colRe.exec(inside))) {
-      const colBody = cm[1] ?? "";
-      columns.push({
-        type: "column",
-        column: { children: markdownToBlocks(colBody) },
-      });
+  const colListOpen = /^<column-list(?:\s[^>]*)?>/i.exec(trimmed);
+  if (colListOpen) {
+    const parsed = parseContainer(trimmed, "column-list", colListOpen[0].length);
+    if (parsed) {
+      const columns: BlockRequest[] = [];
+      // Same balancing story as <tabs>: a column-list nested inside a column
+      // keeps its own columns. The old non-greedy `<column>…</column>` scan
+      // hoisted an inner list's columns up as siblings of the outer one's,
+      // turning a 2-column layout into a 3-column one.
+      for (const item of scanContainerItems(parsed.inner, "column")) {
+        columns.push({
+          type: "column",
+          column: { children: markdownToBlocks(item.inner) },
+        });
+      }
+      if (columns.length === 0) return null;
+      return [{ type: "column_list", column_list: { children: columns } }];
     }
-    if (columns.length === 0) return null;
-    return [{ type: "column_list", column_list: { children: columns } }];
   }
 
   // Standalone <page id="..">Title</page> at block level → link_to_page

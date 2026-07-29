@@ -8,7 +8,7 @@
 
 import type { NotionAccount, ToolContext } from "../mcp/types";
 import { AccountStore } from "./store";
-import { NotionClient } from "../notion/client";
+import { NotionClient, validateBlockBodiesEnabled } from "../notion/client";
 import { recoverFromUnauthorized, refreshAccountToken } from "./refresh";
 import { isTokenExpired } from "../oauth/token";
 
@@ -22,6 +22,10 @@ import { isTokenExpired } from "../oauth/token";
 export function createNotionClient(account: NotionAccount, ctx: ToolContext): NotionClient {
   return new NotionClient(account, {
     onUnauthorized: () => recoverFromUnauthorized(ctx.env, account),
+    // Dev-only body validation. Unset in production, where this resolves to
+    // false and the client's check is a single boolean test on the two methods
+    // that carry blocks. See NotionClient.checkBlockBody().
+    validateBlockBodies: validateBlockBodiesEnabled(ctx.env.VALIDATE_BLOCK_BODIES),
   });
 }
 
@@ -52,11 +56,18 @@ export async function resolveAccount(
 
   // Proactive refresh: if the stored token has a known expiry that has already
   // passed and a refresh token is available, exchange before the caller uses
-  // it. Accounts written by the pre-2026 code carry no `expiresAt`, so
-  // isTokenExpired() returns false for them and this is a no-op — they keep
-  // behaving exactly as they always have, with no re-authorization required.
-  // A failed refresh returns null and we hand back the original account: the
-  // request then produces today's error rather than a new refresh-specific one.
+  // it. A failed refresh returns null and we hand back the original account:
+  // the request then produces today's error rather than a new refresh-specific
+  // one.
+  //
+  // ⚠ UNREACHABLE UNTIL RE-AUTH (as of 2026-07-28). Every account currently in
+  // KV was written before `expiresAt` existed, so isTokenExpired() answers
+  // false for all of them and this branch never fires. That is the intended
+  // migration behaviour — those accounts keep working untouched, no
+  // re-authorization required — but it also means this line has never run
+  // outside its unit tests. It goes live the first time an account is
+  // authorized against a post-2026-06-08 Notion connection, which is when
+  // Notion starts returning `expires_in`. See the header of accounts/refresh.ts.
   if (isTokenExpired(acct, Date.now())) {
     const refreshed = await refreshAccountToken(ctx.env, acct);
     if (refreshed) return refreshed;

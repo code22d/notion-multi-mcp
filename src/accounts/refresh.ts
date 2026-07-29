@@ -17,6 +17,29 @@
 // with the credentials it already had and the request produces today's error.
 // A workspace that has never needed refresh must not start failing because
 // refresh exists.
+//
+// ⚠ STATUS: IMPLEMENTED, UNREACHABLE UNTIL RE-AUTH (as of 2026-07-28)
+//
+// Nothing in this file can execute against any account currently stored in KV.
+// Both entry points funnel through refreshAccountToken(), which returns null on
+// its first line when `account.refreshToken` is absent — and no account record
+// written before 2026-07 has one, because Notion only began issuing refresh
+// tokens to public connections authorized after 2026-06-08. The proactive
+// branch in accounts/resolver.ts is inert for the matching reason: those same
+// records have no `expiresAt`, so isTokenExpired() always answers false.
+//
+// That is by design, not a defect: the migration requirement was that no
+// existing account needs re-authorization, and it is met. But it means the
+// whole path — this file, oauth/token.ts's refresh grant, the `onUnauthorized`
+// hook in notion/client.ts — is exercised only by its unit tests. Treat "token
+// recovery is live" as false until proven otherwise.
+//
+// WHAT WOULD MAKE IT LIVE: re-authorize an account through
+// notion_account_add against a Notion connection created (or re-consented)
+// after 2026-06-08. The OAuth callback persists `refreshToken`/`expiresAt`
+// when Notion returns them (oauth/flow.ts, oauth/token.ts:tokenFieldsFromResponse),
+// and from that account's next 401 onwards this code runs for real. The first
+// live exercise is worth watching: nothing here has ever met the token endpoint.
 // -----------------------------------------------------------------------------
 
 import type { Env, NotionAccount } from "../mcp/types";
