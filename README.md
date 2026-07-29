@@ -147,6 +147,19 @@ Three things to know about it:
 - **It logs block paths, types and violations — never payloads.** No page text, no
   URLs, no icons, no token material.
 
+All three of those, and three more, are pinned by
+[`test/validate-block-bodies.ts`](./test/validate-block-bodies.ts) — off by default
+(byte-identical requests, zero log calls), on for every accepted spelling and no
+other, never throws (including when the validator itself raises mid-walk), never
+leaks (a body stuffed with canaries in every field that could hold something
+private), reports each of the three bodies that caused real production 400s, and
+stays silent on a well-formed body carrying every block type this repo emits.
+
+What it still cannot tell you is whether Notion **agrees** — the table is a
+transcription of the SDK's generated request types, not the server. A false
+positive costs a log line, which is the whole design; a false negative means the
+flag is quietly narrower than it looks. Only a live call closes that.
+
 ## `notion_update_page` — when block ids survive, and when they don't
 
 Notion attaches **block-level comments to block ids**. Delete a block and recreate it

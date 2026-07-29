@@ -174,9 +174,16 @@ export const MEDIA_BLOCK_TYPES: ReadonlySet<string> = new Set([
   "file",
 ]);
 
-/** Fields Notion returns on every block object but rejects on write. */
+/**
+ * Fields Notion returns on every block object but rejects on write.
+ *
+ * `object` is deliberately NOT in this set even though every read response
+ * carries it. The generated request types declare `object?: "block"` on every
+ * alternative (see `TableRowRequest`, `ColumnBlockWithChildrenRequest`), so the
+ * write schema accepts it and reporting it would be a wrong verdict — the one
+ * thing a diagnostic nobody can run against the real API must not produce.
+ */
 export const RESPONSE_ONLY_BLOCK_FIELDS: ReadonlySet<string> = new Set([
-  "object",
   "id",
   "created_time",
   "last_edited_time",
@@ -324,6 +331,16 @@ function validateOne(raw: unknown, tier: number, path: string): BlockRequestProb
     }
     if ("file" in typeBody) {
       push(`\`${type}.file\` is a response-only shape — write schema takes \`external\`/\`file_upload\``);
+    }
+    // The union discriminates on the SOURCE KEY, not on `type` — `type` is
+    // optional in both arms (`{ external: … }` / `{ file_upload: … }`). A body
+    // carrying neither matches no arm however well-formed its `type` looks,
+    // and checking `type` alone silently passed it.
+    if (!("external" in typeBody) && !("file_upload" in typeBody)) {
+      push(
+        `\`${type}\` carries neither \`external\` nor \`file_upload\` — the write ` +
+          `schema has no arm for a media block without a source`
+      );
     }
   }
 
