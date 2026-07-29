@@ -147,6 +147,48 @@ Three things to know about it:
 - **It logs block paths, types and violations — never payloads.** No page text, no
   URLs, no icons, no token material.
 
+## `notion_update_page` — when block ids survive, and when they don't
+
+Notion attaches **block-level comments to block ids**. Delete a block and recreate it
+with the same text and the comment thread does not come back. So "did this edit
+preserve ids?" is really "did this edit preserve the discussion on the page?", and
+`update_content` picks the narrowest of three strategies to keep as many as it can:
+
+| path | what it does | ids preserved |
+| --- | --- | --- |
+| fast | `PATCH /v1/blocks/{id}` on the one leaf block that changed | ✅ all |
+| medium | delete only the affected run, append the replacement anchored after the last unchanged block | ✅ every block outside the affected run |
+| full | delete every block on the page, append the new content | ❌ **none** |
+
+`replace_content` and `apply_template` are always a full rewrite — that is what they
+are for. `update_content` uses the full path only when it has no alternative:
+
+- **the edit changes the first block on the page.** The append endpoint can only place
+  content *after* an existing block, and there is no prepend, so there is no anchor.
+- **the edit inserts more than 100 blocks at once.** That needs several anchored
+  appends in sequence, and their ordering depends on each response echoing the blocks
+  it created — which nothing has yet confirmed against the live API.
+- **every block on the page changed.** Nothing to preserve either way.
+
+Deeply nested insertions used to be a fourth case and are not any more: content nested
+deeper than one request body can carry is now split across follow-up appends *under the
+blocks the anchored append just created*, so the anchor survives.
+
+When the full path does fire, the tool result says what it cost, in as many words:
+
+```
+Full fallback — affected range starts at page index 0 (Notion has no prepend endpoint).
+Replaced page 3acde14e… content — deleted 5 existing blocks, appended 5 new blocks.
+
+⚠️  This rewrote the whole page: every block was deleted and recreated, so block ids
+were NOT preserved and any block-level comments that were attached to them are gone.
+The page's content is intact — this is a structural cost, not a content loss. …
+```
+
+If ids matter for a particular page, keep edits away from the first block — an
+unchanged heading or intro paragraph at the top is enough of an anchor for everything
+below it to take the medium path.
+
 ## Architecture
 
 ```

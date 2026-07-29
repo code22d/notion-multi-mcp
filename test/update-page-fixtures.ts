@@ -433,6 +433,46 @@ export const NESTED_TOGGLE_PAGE: PageFixture = {
   ],
 };
 
+/**
+ * Heading (untouched, so it can serve as the `after:` anchor) plus one
+ * placeholder paragraph. Substituting a deeply-nested container in for
+ * PLACEHOLDER drives a MEDIUM plan whose insertion is too deep for a single
+ * request body — the shape that used to bail to a whole-page replace and take
+ * every block id (and its comments) with it.
+ */
+export const DEEP_INSERT_PAGE: PageFixture = {
+  name: "deep-insert-page",
+  existing: [
+    {
+      object: "block",
+      id: "di-heading",
+      type: "heading_1",
+      has_children: false,
+      heading_1: { rich_text: [rt("Title")], color: "default", is_toggleable: false },
+    } as unknown as HydratedBlock,
+    {
+      object: "block",
+      id: "di-body",
+      type: "paragraph",
+      has_children: false,
+      paragraph: { rich_text: [rt("PLACEHOLDER")], color: "default" },
+    } as unknown as HydratedBlock,
+  ],
+};
+
+/** Markdown that nests five levels — deeper than one request body can carry. */
+export const FIVE_DEEP_MARKDOWN = `<details><summary>L1</summary>
+<details><summary>L2</summary>
+<details><summary>L3</summary>
+<details><summary>L4</summary>
+<details><summary>L5</summary>
+Deepest content marker L6-BODY.
+</details>
+</details>
+</details>
+</details>
+</details>`;
+
 /** Three-block page used by the span-tracker tests. Non-trivial offsets. */
 export const THREE_BLOCK_PAGE: PageFixture = {
   name: "three-block-page",

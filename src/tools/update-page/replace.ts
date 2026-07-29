@@ -25,6 +25,7 @@ import {
   AUTHORED_CLONE_POLICY,
   appendClonedTree,
   fitRequestTree,
+  hasPendingWork,
 } from "../../notion/block-clone";
 import { checkPreservation } from "./preservation";
 
@@ -33,9 +34,14 @@ import { checkPreservation } from "./preservation";
  * directly, and replace_content wraps it to do the whole page at once.
  *
  * When `afterId` is provided, Notion's `after:` parameter anchors the
- * insertion immediately after that block. Caller must ensure insertBlocks fits
- * in a single 100-item append — for larger batches, either chunk without an
- * anchor (i.e. full replace) or fall back to delete-all + append-all.
+ * insertion immediately after that block.
+ *
+ * The inserted tree goes through the same write-schema fitting the create path
+ * uses, so an insertion nested deeper than one request body can carry is split
+ * across follow-up appends instead of forcing the caller to give up on the
+ * anchor. Those follow-ups land under blocks this call just created, which hold
+ * nothing else — so only the FIRST request needs the anchor, and preserving it
+ * is what keeps the untouched blocks on the page (and their comments) alive.
  */
 export async function replaceBlockRange(
   client: NotionClient,
@@ -43,7 +49,7 @@ export async function replaceBlockRange(
   deleteIds: string[],
   insertBlocks: BlockRequest[],
   afterId?: string
-): Promise<{ deleted: number; inserted: number }> {
+): Promise<{ deleted: number; inserted: number; deferred: boolean }> {
   let deleted = 0;
   for (const id of deleteIds) {
     try {
@@ -53,12 +59,12 @@ export async function replaceBlockRange(
       // Block may already be archived or missing — press on.
     }
   }
-  if (insertBlocks.length > 0) {
-    const body: { children: BlockRequest[]; after?: string } = { children: insertBlocks };
-    if (afterId) body.after = afterId;
-    await client.appendBlockChildren(pageId, body);
-  }
-  return { deleted, inserted: insertBlocks.length };
+  if (insertBlocks.length === 0) return { deleted, inserted: 0, deferred: false };
+
+  const fitted = fitRequestTree(insertBlocks);
+  const deferred = hasPendingWork(fitted);
+  await appendClonedTree(client, pageId, fitted, AUTHORED_CLONE_POLICY, afterId);
+  return { deleted, inserted: fitted.length, deferred };
 }
 
 export interface ReplaceContentOptions {

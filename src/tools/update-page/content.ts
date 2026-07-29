@@ -19,6 +19,12 @@
 //              affected range starts at page index 0 (no anchor available for
 //              Notion's `after:` append) or when every block changes.
 //
+// The full path is CORRECT but not free, and the cost is invisible in the
+// result unless we say it: it deletes and recreates every block, so block ids
+// change and block-level comments attached to them are lost. That is the exact
+// thing the fast and medium paths exist to protect, so whenever we fall back to
+// it the tool result says so in as many words — see fullFallback() below.
+//
 // Error cases:
 //   - old_str not found in the rendered markdown
 //   - old_str matches multiple times AND replace_all_matches isn't true
@@ -30,7 +36,6 @@ import type { NotionClient } from "../../notion/client";
 import type { ToolResult } from "../../mcp/types";
 import { blocksToMarkdown } from "../../notion/markdown/from-blocks";
 import { markdownToBlocks } from "../../notion/markdown/to-blocks";
-import { fitRequestTree, hasPendingWork } from "../../notion/block-clone";
 import { hydrateChildren, textErr, textOk } from "./shared";
 import { replaceBlockRange, replaceContentHandler } from "./replace";
 import { checkPreservation } from "./preservation";
@@ -47,10 +52,14 @@ export interface UpdateContentOptions {
 }
 
 /**
- * medium-path insertion cap. If the planner wants to insert more than this in
- * one batch, we bail to the full path (which chunks via appendInChunks).
- * Notion's append endpoint caps at 100 children per call, and using `after:`
- * across multiple chunks inverts the insertion order — simpler to fall back.
+ * medium-path insertion cap. Notion's append endpoint takes at most 100
+ * children per call, so a bigger insertion needs several anchored appends in
+ * sequence. appendInChunks() does walk the anchor forward between chunks, so
+ * the order would hold — but only if every chunk's response comes back with
+ * the blocks it created, and nothing has ever observed that against the real
+ * API. Until it has, an insertion this large takes the full path, which needs
+ * no anchor at all. That is a deliberate trade of id preservation for an
+ * ordering guarantee, and the fallback message names what it cost.
  */
 const MEDIUM_PATH_INSERT_CAP = 100;
 
@@ -163,22 +172,14 @@ async function executePlan(
       if (plan.insertBlocks.length > MEDIUM_PATH_INSERT_CAP) {
         return fullFallback(client, pageId, finalMd, existing, opts, "medium-path insertion exceeded 100 blocks");
       }
-      // Same reasoning for depth. The medium path is one anchored append
-      // (`after:`), and appendClonedTree has no `after` — so a tree too deep
-      // for a single request body cannot be split here without losing the
-      // anchor. Hand it to the full path, which does handle deferral. Costs
-      // the id preservation this path exists for; the alternative is a 400.
-      if (hasPendingWork(fitRequestTree(plan.insertBlocks))) {
-        return fullFallback(
-          client,
-          pageId,
-          finalMd,
-          existing,
-          opts,
-          "medium-path insertion nested deeper than one request body can carry"
-        );
-      }
-      const { deleted, inserted } = await replaceBlockRange(
+      // Depth used to bail here too: the medium path is one anchored append
+      // (`after:`) and appendClonedTree had no `after`, so a tree too deep for
+      // a single request body could not be split without losing the anchor —
+      // and losing the anchor meant a whole-page replace, which is exactly the
+      // id loss this path exists to avoid. appendClonedTree now takes the
+      // anchor, so replaceBlockRange fits and defers like every other write
+      // path and the depth cliff is gone.
+      const { deleted, inserted, deferred } = await replaceBlockRange(
         client,
         pageId,
         plan.deleteIds,
@@ -189,7 +190,10 @@ async function executePlan(
       return (
         `Medium path: deleted ${deleted} block${deleted === 1 ? "" : "s"}, ` +
         `inserted ${inserted} replacement${inserted === 1 ? "" : "s"} after block ${plan.afterId}. ` +
-        `${preservedCount} existing block${preservedCount === 1 ? "" : "s"} kept their ids (and any attached comments).`
+        `${preservedCount} existing block${preservedCount === 1 ? "" : "s"} kept their ids (and any attached comments).` +
+        (deferred
+          ? ` Content nested deeper than one request body can carry was appended in follow-up requests.`
+          : "")
       );
     }
 
@@ -215,7 +219,19 @@ async function fullFallback(
   });
   const inner = result.content[0]?.text ?? "";
   void opts;
-  return `Full fallback (${reason}): ${inner}`;
+  // Say what the fallback COST, not just that it happened. This path deletes
+  // and recreates every block on the page, so it undoes precisely what the
+  // fast and medium paths exist to protect — and "content updated" reads like
+  // a success until someone goes looking for a comment thread that is no
+  // longer there. Silence here is how that gets discovered a week later.
+  return (
+    `Full fallback — ${reason}. ${inner}\n\n` +
+    `⚠️  This rewrote the whole page: every block was deleted and recreated, so ` +
+    `block ids were NOT preserved and any block-level comments that were attached ` +
+    `to them are gone. The page's content is intact — this is a structural cost, ` +
+    `not a content loss. update_content's fast and medium paths keep ids and ` +
+    `comments; this edit could not use either, for the reason above.`
+  );
 }
 
 // -----------------------------------------------------------------------------

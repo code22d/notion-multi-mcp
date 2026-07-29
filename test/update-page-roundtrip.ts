@@ -24,9 +24,16 @@ import { cloneBlockForRequest, normalizeId } from "../src/tools/update-page/shar
 import { countOccurrences, updateContentHandler } from "../src/tools/update-page/content.ts";
 import { replaceContentHandler } from "../src/tools/update-page/replace.ts";
 import { planUpdate } from "../src/tools/update-page/diff.ts";
+import { appendInChunks } from "../src/notion/block-clone.ts";
+import {
+  describeBlockRequestProblems,
+  validateBlockRequestTree,
+} from "../src/notion/block-write-schema.ts";
 import {
   CLONE_FIXTURES,
+  DEEP_INSERT_PAGE,
   FAST_PATH_PAGE,
+  FIVE_DEEP_MARKDOWN,
   FULL_FALLBACK_PAGE,
   HELLO_WORLD_PAGE,
   NESTED_TOGGLE_PAGE,
@@ -161,6 +168,28 @@ function makeFakeClient(initial: HydratedBlock[]): { client: NotionClient; calls
   }
   const calls: FakeCall[] = [];
 
+  // Materialise an appended REQUEST block the way Notion does: give it an id,
+  // move its inline `children` out of the type body into their own listable
+  // level, and recurse. Registering leaves too (with an empty child list) is
+  // what stops listAllBlockChildren() falling back to the page's children and
+  // making a brand-new block look like it already had content.
+  let seq = 0;
+  const register = (raw: HydratedBlock): HydratedBlock => {
+    const id = `new-${++seq}`;
+    const type = String((raw as unknown as { type?: unknown }).type ?? "paragraph");
+    const payload = { ...((raw as unknown as Record<string, unknown>)[type] as Record<string, unknown> | undefined) };
+    const kids = Array.isArray(payload.children) ? (payload.children as HydratedBlock[]) : [];
+    delete payload.children;
+    childrenByParent.set(id, kids.map(register));
+    return {
+      object: "block",
+      id,
+      type,
+      has_children: kids.length > 0,
+      [type]: payload,
+    } as unknown as HydratedBlock;
+  };
+
   const fake = {
     listBlockChildren: async (blockId: string): Promise<PaginatedList<NotionBlockObject>> => {
       calls.push({ method: "listBlockChildren", args: [blockId] });
@@ -190,14 +219,17 @@ function makeFakeClient(initial: HydratedBlock[]): { client: NotionClient; calls
     ): Promise<PaginatedList<NotionBlockObject>> => {
       calls.push({ method: "appendBlockChildren", args: [parentId, body] });
       const children = ((body as { children?: unknown[] })?.children ?? []) as HydratedBlock[];
-      // Assign synthetic ids for round-tripping.
-      const stamped: HydratedBlock[] = children.map((c, i) => ({
-        ...c,
-        id: `new-${parentId.slice(0, 4)}-${i}`,
-        object: "block",
-      })) as HydratedBlock[];
-      const root = childrenByParent.get("__root__") ?? [];
-      childrenByParent.set("__root__", [...root, ...stamped]);
+      const stamped = children.map(register);
+      // Honour `after:` the way Notion does — insert immediately behind the
+      // named sibling, not at the end. Without that a test cannot tell an
+      // anchored append from an unanchored one by looking at the page.
+      const after = (body as { after?: unknown })?.after;
+      const key = childrenByParent.has(parentId) ? parentId : "__root__";
+      const list = [...(childrenByParent.get(key) ?? [])];
+      const at = typeof after === "string" ? list.findIndex((b) => b.id === after) : -1;
+      if (at >= 0) list.splice(at + 1, 0, ...stamped);
+      else list.push(...stamped);
+      childrenByParent.set(key, list);
       return {
         object: "list",
         results: stamped as unknown as NotionBlockObject[],
@@ -464,6 +496,126 @@ console.log("\n[update_content — validation + error cases (unchanged from Phas
   const { client } = makeFakeClient([]);
   const result = await updateContentHandler(client, "page-1", [{ old_str: "a", new_str: "b" }]);
   assert(result.isError === true, "empty page is an error for update_content");
+}
+
+// -----------------------------------------------------------------------------
+// The block-id cliff — a medium-path insertion too deep for one request body
+//
+// This used to bail to the full path, which deletes and recreates every block
+// on the page: ids gone, block-level comments gone. The fallback was correct
+// (a valid request that loses ids beats an invalid one that loses everything)
+// but it silently undid the exact thing the medium path exists for.
+// -----------------------------------------------------------------------------
+
+console.log("\n[update_content — deep insertion stays on the medium path]");
+
+{
+  const { client, calls, currentChildren } = makeFakeClient(DEEP_INSERT_PAGE.existing);
+  const result = await updateContentHandler(client, "page-1", [
+    { old_str: "PLACEHOLDER", new_str: FIVE_DEEP_MARKDOWN },
+  ]);
+
+  assert(!result.isError, "deep insertion succeeds");
+  const text = result.content[0]?.text ?? "";
+  assert(text.includes("Medium path"), "…on the MEDIUM path, not the full fallback");
+  assert(!text.includes("Full fallback"), "…and does not report a whole-page replace");
+  assert(
+    text.includes("follow-up requests"),
+    "the summary says the over-deep part went out separately rather than pretending it fit"
+  );
+
+  const deletedIds = calls.filter((c) => c.method === "deleteBlock").map((c) => c.args[0] as string);
+  eq(deletedIds, ["di-body"], "only the replaced paragraph is deleted — the heading keeps its id");
+
+  const appends = calls.filter((c) => c.method === "appendBlockChildren");
+  assert(appends.length > 1, `deferral engaged — ${appends.length} appends, not one`);
+  const first = appends[0]!.args[1] as { children: unknown[]; after?: string };
+  eq(first.after, "di-heading", "the first append is still anchored after the surviving heading");
+  assert(
+    appends.slice(1).every((c) => (c.args[1] as { after?: string }).after === undefined),
+    "follow-up appends carry no anchor — they target blocks that hold nothing else"
+  );
+
+  // Every emitted body has to be one Notion would take. A stubbed client
+  // accepts anything, so assert the bytes against the write schema instead.
+  for (let i = 0; i < appends.length; i++) {
+    const body = appends[i]!.args[1] as { children: unknown };
+    const problems = validateBlockRequestTree(body.children);
+    eq(
+      describeBlockRequestProblems(problems),
+      "",
+      `append[${i}] is a body the write schema accepts`
+    );
+  }
+
+  // …and the content actually arrives, all five levels of it.
+  const wire = JSON.stringify(appends.map((c) => c.args[1]));
+  for (const marker of ["L1", "L2", "L3", "L4", "L5", "L6-BODY"]) {
+    assert(wire.includes(marker), `"${marker}" reached the wire`);
+  }
+
+  const rootIds = currentChildren().map((b) => b.id);
+  eq(rootIds[0], "di-heading", "the heading is still first and still itself");
+  eq(rootIds.length, 2, "the page ends up with the heading plus the one new top-level block");
+}
+
+console.log("\n[update_content — the full fallback says what it cost]");
+
+{
+  const { client } = makeFakeClient(FULL_FALLBACK_PAGE.existing);
+  const result = await updateContentHandler(client, "page-1", [
+    { old_str: "Alice", new_str: "Charlie" },
+  ]);
+  const text = result.content[0]?.text ?? "";
+  assert(text.includes("Full fallback"), "still reports the fallback");
+  assert(
+    text.includes("ids were NOT preserved"),
+    "…and now says block ids were not preserved"
+  );
+  assert(
+    text.includes("comments"),
+    "…and names the block-level comments that went with them"
+  );
+  assert(
+    text.includes("content is intact"),
+    "…while being clear the page's content itself survived"
+  );
+}
+
+console.log("\n[appendInChunks] a second anchored chunk follows the first, not the anchor");
+
+{
+  // `after:` inserts immediately behind the named block, so re-using the
+  // ORIGINAL anchor for chunk 2 would put it in front of chunk 1. The anchor
+  // has to walk forward. 150 blocks = two chunks.
+  const { client, calls, currentChildren } = makeFakeClient(HELLO_WORLD_PAGE.existing);
+  const blocks = Array.from({ length: 150 }, (_, i) => ({
+    type: "paragraph",
+    paragraph: { rich_text: [{ type: "text", text: { content: `P${i}` } }] },
+  })) as unknown as Parameters<typeof appendInChunks>[2];
+
+  await appendInChunks(client as unknown as NotionClient, "page-1", blocks, "b1");
+
+  const appends = calls.filter((c) => c.method === "appendBlockChildren");
+  eq(appends.length, 2, "150 blocks → two chunks");
+  eq((appends[0]!.args[1] as { after?: string }).after, "b1", "chunk 1 anchors at the caller's block");
+  const chunk1 = (appends[0]!.args[1] as { children: unknown[] }).children;
+  eq(chunk1.length, 100, "chunk 1 is a full 100");
+  assert(
+    (appends[1]!.args[1] as { after?: string }).after !== "b1",
+    "chunk 2 does NOT re-use the original anchor"
+  );
+
+  const texts = currentChildren().map(
+    (b) => ((b as unknown as Record<string, { rich_text?: Array<{ text?: { content?: string } }> }>)
+      .paragraph?.rich_text?.[0]?.text?.content) ?? ""
+  );
+  const p0 = texts.indexOf("P0");
+  const p99 = texts.indexOf("P99");
+  const p100 = texts.indexOf("P100");
+  const p149 = texts.indexOf("P149");
+  assert(p0 >= 0 && p99 === p0 + 99 && p100 === p99 + 1 && p149 === p100 + 49,
+    "all 150 landed in request order, chunk 2 immediately after chunk 1");
 }
 
 // -----------------------------------------------------------------------------
