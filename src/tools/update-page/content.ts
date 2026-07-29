@@ -12,12 +12,14 @@
 //
 //   - fast   — in-place updateBlock on a single leaf block. Block id preserved,
 //              so any comments on that block stay attached.
-//   - medium — delete the affected range and append replacements immediately
-//              after the last unchanged prefix block. Unaffected blocks
-//              (including their ids) are left alone.
-//   - full   — delete everything and append everything. Only used when the
-//              affected range starts at page index 0 (no anchor available for
-//              Notion's `after:` append) or when every block changes.
+//   - medium — delete the affected range and append replacements at the right
+//              spot, using Notion's append `position` (2026-03-11) — behind the
+//              last unchanged prefix block, or at the start of the page when
+//              there isn't one. Unaffected blocks (including their ids) are
+//              left alone.
+//   - full   — delete everything and append everything. Only used when every
+//              block on the page changed (nothing left to preserve) or when the
+//              insertion is too large to place in a single call.
 //
 // The full path is CORRECT but not free, and the cost is invisible in the
 // result unless we say it: it deletes and recreates every block, so block ids
@@ -184,12 +186,16 @@ async function executePlan(
         pageId,
         plan.deleteIds,
         plan.insertBlocks,
-        plan.afterId
+        plan.position
       );
+      const where =
+        plan.position.type === "after_block"
+          ? `after block ${plan.position.after_block.id}`
+          : "at the top of the page";
       const preservedCount = existing.length - plan.deleteIds.length;
       return (
         `Medium path: deleted ${deleted} block${deleted === 1 ? "" : "s"}, ` +
-        `inserted ${inserted} replacement${inserted === 1 ? "" : "s"} after block ${plan.afterId}. ` +
+        `inserted ${inserted} replacement${inserted === 1 ? "" : "s"} ${where}. ` +
         `${preservedCount} existing block${preservedCount === 1 ? "" : "s"} kept their ids (and any attached comments).` +
         (deferred
           ? ` Content nested deeper than one request body can carry was appended in follow-up requests.`

@@ -31,8 +31,11 @@ export interface PropertyFixture {
   input: Record<string, unknown>;
   /** Expected Notion-shape props. `null` means the key should be cleared (pass-through null). */
   expected: Record<string, unknown>;
-  /** If set, expect these archive/trash flags to be set at the top level. */
-  expectedArchived?: boolean;
+  /**
+   * If set, expect `in_trash` at the top level. There is no `expectedArchived`
+   * counterpart: 2026-03-11 removed `archived` from the API, so a caller's
+   * `archived` key is translated to `in_trash` and never leaves the process.
+   */
   expectedInTrash?: boolean;
 }
 
@@ -75,12 +78,12 @@ export const PROPERTY_FIXTURES: PropertyFixture[] = [
     },
   },
   {
-    name: "archive-flag-lifted-to-top-level",
+    name: "archived-alias-translated-to-in-trash",
     input: { archived: true, Name: "Done" },
     expected: {
       Name: { title: [{ type: "text", text: { content: "Done" } }] },
     },
-    expectedArchived: true,
+    expectedInTrash: true,
   },
   {
     name: "array-of-strings-multi-select",
@@ -388,9 +391,14 @@ export const FAST_PATH_PAGE: PageFixture = {
   ],
 };
 
-/** Only one block — any edit hits the first block → full fallback. */
-export const FULL_FALLBACK_PAGE: PageFixture = {
-  name: "full-fallback-page",
+/**
+ * One leaf block, edited. No prefix to anchor to — but the fast path names its
+ * target by id and needs no anchor, so this is an in-place updateBlock. It used
+ * to fall through to a whole-page rewrite because the no-prefix bail was
+ * checked first.
+ */
+export const FIRST_BLOCK_EDIT_PAGE: PageFixture = {
+  name: "first-block-edit-page",
   existing: [
     {
       object: "block",
@@ -398,6 +406,66 @@ export const FULL_FALLBACK_PAGE: PageFixture = {
       type: "paragraph",
       has_children: false,
       paragraph: { rich_text: [rt("Alice says hi")], color: "default" },
+    } as unknown as HydratedBlock,
+  ],
+};
+
+/**
+ * Two paragraphs, both mentioning Alice: no prefix, no suffix, every block
+ * affected. Nothing to preserve, so this is the one shape that still takes the
+ * full rewrite.
+ */
+export const ENTIRE_PAGE_CHANGED_PAGE: PageFixture = {
+  name: "entire-page-changed-page",
+  existing: [
+    {
+      object: "block",
+      id: "ep-1",
+      type: "paragraph",
+      has_children: false,
+      paragraph: { rich_text: [rt("Alice arrives first.")], color: "default" },
+    } as unknown as HydratedBlock,
+    {
+      object: "block",
+      id: "ep-2",
+      type: "paragraph",
+      has_children: false,
+      paragraph: { rich_text: [rt("Then Alice leaves.")], color: "default" },
+    } as unknown as HydratedBlock,
+  ],
+};
+
+/**
+ * A toggle at index 0 (so no prefix, and not a fast-path leaf) followed by an
+ * untouched paragraph (so there IS something worth preserving). Editing inside
+ * the toggle is the case `position: { type: "start" }` exists for — before
+ * 2026-03-11 it had to be a whole-page rewrite.
+ */
+export const START_POSITION_PAGE: PageFixture = {
+  name: "start-position-page",
+  existing: [
+    {
+      object: "block",
+      id: "sp-toggle",
+      type: "toggle",
+      has_children: true,
+      toggle: { rich_text: [rt("Hide")], color: "default" },
+      children: [
+        {
+          object: "block",
+          id: "sp-inner",
+          type: "paragraph",
+          has_children: false,
+          paragraph: { rich_text: [rt("Inner Alice")], color: "default" },
+        } as unknown as HydratedBlock,
+      ],
+    } as unknown as HydratedBlock,
+    {
+      object: "block",
+      id: "sp-tail",
+      type: "paragraph",
+      has_children: false,
+      paragraph: { rich_text: [rt("Tail stays put.")], color: "default" },
     } as unknown as HydratedBlock,
   ],
 };

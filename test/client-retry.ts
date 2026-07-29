@@ -15,7 +15,7 @@
 //   - non-retriable statuses still throw immediately
 // -----------------------------------------------------------------------------
 
-import { NotionClient, parseRetryAfterMs } from "../src/notion/client.ts";
+import { NOTION_VERSION, NotionClient, parseRetryAfterMs } from "../src/notion/client.ts";
 import type { NotionAccount } from "../src/mcp/types.ts";
 
 let passed = 0;
@@ -445,7 +445,12 @@ console.log("\n[happy path] a 200 on the first try makes one call and no sleeps"
   eq(out.id, "p9", "returns the parsed body");
   eq(h.calls(), 1, "one fetch");
   eq(h.sleeps, [], "no sleeps");
-  eq(h.inits[0]?.headers?.["notion-version"], "2025-09-03", "pinned API version unchanged");
+  // Pinned deliberately, and asserted from the constant rather than a literal
+  // so a bump is a one-line change here instead of a mystery failure. The
+  // literal is here too, because "we send whatever the constant says" would
+  // pass even if the constant were empty.
+  eq(h.inits[0]?.headers?.["notion-version"], NOTION_VERSION, "the pinned API version is what goes on the wire");
+  eq(NOTION_VERSION, "2026-03-11", "…and it is 2026-03-11");
 }
 
 // -----------------------------------------------------------------------------

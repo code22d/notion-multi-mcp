@@ -53,18 +53,15 @@ export async function updatePropertiesHandler(
     resolveType = await resolveTypesForPage(client, pageId);
   }
 
-  const { notionProps, archived, inTrash, isLocked, error } = normaliseProperties(propsRaw, resolveType);
+  const { notionProps, inTrash, isLocked, error } = normaliseProperties(propsRaw, resolveType);
   if (error) return textErr(error);
   if (notionProps && Object.keys(notionProps).length > 0) {
     body.properties = notionProps;
   }
-  // TODO(2026-03-11): `archived` is REMOVED in API version 2026-03-11 —
-  // `in_trash` is its replacement and both are sent today. On 2025-09-03 (what
-  // src/notion/client.ts pins) `archived` still works, and sending both is
-  // what the field has been running, so the behaviour is left intact. When the
-  // version is bumped, delete this line and the `archived` plumbing in
-  // normaliseProperties() below, keeping `in_trash` only.
-  if (archived !== undefined) body.archived = archived;
+  // `archived` is removed from requests in 2026-03-11; `in_trash` replaced it.
+  // We still ACCEPT `archived` from callers — it is a documented alias in the
+  // tool schema and dropping it would break anyone using it — but it is
+  // translated in normaliseProperties() and never reaches the wire.
   if (inTrash !== undefined) body.in_trash = inTrash;
   if (isLocked !== undefined) body.is_locked = isLocked;
 
@@ -83,7 +80,6 @@ export async function updatePropertiesHandler(
   if (body.properties) touched.push(`${Object.keys(body.properties as Record<string, unknown>).length} properties`);
   if (body.cover !== undefined) touched.push(body.cover === null ? "cover removed" : "cover set");
   if (body.icon !== undefined) touched.push(body.icon === null ? "icon removed" : "icon set");
-  if (body.archived !== undefined) touched.push(body.archived ? "archived" : "unarchived");
   if (body.in_trash !== undefined) touched.push(body.in_trash ? "moved to trash" : "restored from trash");
   if (body.is_locked !== undefined) touched.push(body.is_locked ? "locked" : "unlocked");
   return textOk(`Updated page ${pageId} — ${touched.join(", ")}.`);
@@ -91,7 +87,11 @@ export async function updatePropertiesHandler(
 
 export interface NormalisedProps {
   notionProps: Record<string, unknown>;
-  archived?: boolean;
+  /**
+   * PATCH /v1/pages `in_trash`. A caller's `archived` key lands here too —
+   * 2026-03-11 removed `archived` from the API, but it stays a valid INPUT
+   * alias, so the translation happens here rather than at the wire.
+   */
   inTrash?: boolean;
   /** PATCH /v1/pages `is_locked` — lock the page against edits in the UI. */
   isLocked?: boolean;
@@ -157,7 +157,10 @@ export function normaliseProperties(
   }
 
   const out: Record<string, unknown> = {};
-  let archived: boolean | undefined;
+  // Tracked separately so an explicit `in_trash` always wins over the legacy
+  // `archived` alias when a caller passes both and they disagree — the newer
+  // key is the one that names what the API actually does.
+  let archivedAlias: boolean | undefined;
   let inTrash: boolean | undefined;
   let isLocked: boolean | undefined;
 
@@ -166,10 +169,11 @@ export function normaliseProperties(
     let key = rawKey;
     if (key.startsWith("userDefined:")) key = key.slice("userDefined:".length);
 
-    // Top-level archive/trash controls.
+    // Top-level archive/trash controls. `archived` is the pre-2026-03-11 name;
+    // it is still accepted from callers and folded into `in_trash` below.
     if (key === "archived") {
-      if (typeof value === "boolean") archived = value;
-      else archived = value === "__YES__" || value === 1;
+      if (typeof value === "boolean") archivedAlias = value;
+      else archivedAlias = value === "__YES__" || value === 1;
       continue;
     }
     if (key === "in_trash") {
@@ -241,5 +245,5 @@ export function normaliseProperties(
     };
   }
 
-  return { notionProps: out, archived, inTrash, isLocked };
+  return { notionProps: out, inTrash: inTrash ?? archivedAlias, isLocked };
 }

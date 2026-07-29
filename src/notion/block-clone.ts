@@ -23,7 +23,7 @@
 // clone result is a tree of ClonedBlock rather than a bare BlockRequest[].
 // -----------------------------------------------------------------------------
 
-import type { NotionBlockObject, NotionClient } from "./client";
+import type { BlockPosition, NotionBlockObject, NotionClient } from "./client";
 import type { HydratedBlock } from "./markdown/from-blocks";
 import type { BlockRequest } from "./markdown/to-blocks";
 import {
@@ -365,33 +365,37 @@ export function hasPendingWork(cloned: ClonedBlock[]): boolean {
 /** Append request blocks under `parentId` in 100-item chunks, collecting the
  *  blocks Notion created so callers can address them by id.
  *
- *  `after` anchors the FIRST chunk immediately behind an existing sibling
- *  (Notion's `after:` parameter). Omit it and every chunk lands at the end of
- *  the parent, which is what every append here did before update_content's
- *  medium path needed to insert into the middle of a page. */
+ *  `position` says where the FIRST chunk lands — 2026-03-11's replacement for
+ *  the flat `after` string. Omit it and every chunk goes to the end of the
+ *  parent, which is what every append here did before update_content's medium
+ *  path needed to insert into the middle of a page. */
 export async function appendInChunks(
   client: Pick<NotionClient, "appendBlockChildren">,
   parentId: string,
   blocks: BlockRequest[],
-  after?: string
+  position?: BlockPosition
 ): Promise<NotionBlockObject[]> {
   const created: NotionBlockObject[] = [];
-  let anchor = after;
+  let at = position;
   for (let i = 0; i < blocks.length; i += CHILDREN_PER_REQUEST) {
     const slice = blocks.slice(i, i + CHILDREN_PER_REQUEST);
-    const body: { children: BlockRequest[]; after?: string } = { children: slice };
-    if (anchor) body.after = anchor;
+    const body: { children: BlockRequest[]; position?: BlockPosition } = { children: slice };
+    // `end` is the default, so sending it is noise; omitting it keeps shallow
+    // bodies byte-identical to what they were before positions existed.
+    if (at && at.type !== "end") body.position = at;
     const res = await client.appendBlockChildren(parentId, body);
     const results = (res as { results?: unknown })?.results;
     if (Array.isArray(results)) {
       created.push(...(results as NotionBlockObject[]));
-      // Walk the anchor forward to the last block we just inserted. Re-using
-      // the ORIGINAL anchor for a second chunk would place it *before* the
-      // first — `after:` inserts immediately behind the named block, so
-      // anchoring twice at the same spot reverses the chunks. Unanchored
-      // appends need none of this; they already accumulate at the end.
+      // Walk the position forward to the last block we just inserted. Re-using
+      // the ORIGINAL position for a second chunk would place it *before* the
+      // first — both `after_block` and `start` name a fixed spot, so using
+      // either twice reverses the chunks. Unpositioned appends need none of
+      // this; they already accumulate at the end.
       const last = results[results.length - 1] as NotionBlockObject | undefined;
-      if (anchor && typeof last?.id === "string") anchor = last.id;
+      if (at && at.type !== "end" && typeof last?.id === "string") {
+        at = { type: "after_block", after_block: { id: last.id } };
+      }
     }
   }
   return created;
@@ -407,7 +411,7 @@ type AppendClient = Pick<NotionClient, "appendBlockChildren" | "listAllBlockChil
  * parent's children, because the parent may already have content — re-listing
  * would pair our clones against blocks that were there before.
  *
- * `after` anchors the top-level append (see appendInChunks). The follow-up
+ * `position` places the top-level append (see appendInChunks). The follow-up
  * appends that resolve deferred subtrees never need one: they target blocks
  * that were just created and hold nothing else, so "the end" is the only place
  * their children can go.
@@ -417,9 +421,9 @@ export async function appendClonedTree(
   parentId: string,
   cloned: ClonedBlock[],
   policy: ClonePolicy,
-  after?: string
+  position?: BlockPosition
 ): Promise<void> {
-  const created = await appendInChunks(client, parentId, cloned.map((c) => c.request), after);
+  const created = await appendInChunks(client, parentId, cloned.map((c) => c.request), position);
   if (!hasPendingWork(cloned)) return;
   await resolveAgainst(client, created, cloned, policy);
 }

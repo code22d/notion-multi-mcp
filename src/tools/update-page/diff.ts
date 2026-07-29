@@ -9,13 +9,15 @@
 //              with the new type-payload. Block id is preserved so comments on
 //              the block stay attached.
 //   - medium — delete a contiguous run of old blocks + append a run of new
-//              blocks immediately after the last unchanged prefix block.
-//              Uses Notion's appendBlockChildren `after:` anchor. Requires
-//              AT LEAST ONE common prefix block — the Notion API has no
-//              "prepend at start of page" endpoint.
-//   - full   — fall back to Phase 5's delete-all + append-all. Used when the
-//              affected range starts at index 0 (no anchor available) or when
-//              no blocks match on either end.
+//              blocks at the right spot. Uses appendBlockChildren's `position`
+//              (2026-03-11): `after_block` behind the last unchanged prefix
+//              block, or `start` when the affected range begins at index 0.
+//              Before `position` existed the second case had no expression at
+//              all and had to be a full rewrite.
+//   - full   — fall back to Phase 5's delete-all + append-all. Used only when
+//              every block on the page changed, i.e. there is nothing left to
+//              preserve, or when the insertion is too large to place in one
+//              call (see MEDIUM_PATH_INSERT_CAP in content.ts).
 //
 // Alignment is done by comparing the single-block markdown rendering of each
 // block on each side. This reuses the full from-blocks + to-blocks pipelines
@@ -23,6 +25,7 @@
 // -----------------------------------------------------------------------------
 
 import { blocksToMarkdown, type HydratedBlock } from "../../notion/markdown/from-blocks";
+import type { BlockPosition } from "../../notion/client";
 import type { BlockRequest } from "../../notion/markdown/to-blocks";
 
 /** Block types whose native payload is just a rich_text (+ small scalars). */
@@ -53,8 +56,13 @@ export type UpdatePlan =
       deleteIds: string[];
       /** New blocks to insert (request-shape). */
       insertBlocks: BlockRequest[];
-      /** Block id to pass as Notion's `after:` anchor — last common-prefix block. */
-      afterId: string;
+      /**
+       * Where the insertion goes — Notion's `position` object (2026-03-11).
+       * `after_block` behind the last common-prefix block, or `start` when the
+       * affected range begins at page index 0 and there is nothing in front of
+       * it to anchor to.
+       */
+      position: BlockPosition;
     }
   | {
       kind: "full";
@@ -102,23 +110,14 @@ export function planUpdate(oldBlocks: HydratedBlock[], newBlocks: BlockRequest[]
     return { kind: "noop" };
   }
 
-  // "Full fallback" conditions — when we can't construct a `after:` anchor.
-  //   - No prefix blocks at all (affected range starts at page index 0)
-  //   - Every block is affected (affectedOld.length === oldBlocks.length)
-  if (prefix === 0) {
-    return {
-      kind: "full",
-      reason:
-        affectedOld.length === oldBlocks.length && affectedNew.length === newBlocks.length
-          ? "entire page changed"
-          : "affected range starts at page index 0 (Notion has no prepend endpoint)",
-    };
-  }
-
-  const afterId = oldBlocks[prefix - 1]!.id;
-
   // Fast path: 1:1 replacement with same leaf type and no children on either
   // side. updateBlock preserves the block id → any comments stay attached.
+  //
+  // This is checked BEFORE the no-prefix case below, and the order matters: an
+  // updateBlock names its target by id and needs no anchor at all, so a page
+  // whose FIRST (or only) block gets a one-word edit belongs here. It used to
+  // fall out of the prefix===0 branch into a whole-page rewrite, losing the id
+  // and every comment on it to preserve an anchor nothing was going to use.
   if (
     affectedOld.length === 1 &&
     affectedNew.length === 1 &&
@@ -134,13 +133,34 @@ export function planUpdate(oldBlocks: HydratedBlock[], newBlocks: BlockRequest[]
     };
   }
 
+  // No common prefix — the insertion goes at the very top of the page. Before
+  // 2026-03-11 that was a full rewrite, because the only placement the append
+  // endpoint offered was `after:<block>` and there was no block in front to
+  // name. `position: { type: "start" }` is exactly that missing prepend, so
+  // the trailing blocks (and their ids, and their comments) survive.
+  //
+  // The one case still worth a full rewrite is when EVERY block changed:
+  // there is nothing left to preserve, and delete-all + append-all is one
+  // fewer moving part than delete-all + prepend.
+  if (prefix === 0) {
+    if (affectedOld.length === oldBlocks.length && affectedNew.length === newBlocks.length) {
+      return { kind: "full", reason: "entire page changed" };
+    }
+    return {
+      kind: "medium",
+      deleteIds: affectedOld.map((b) => b.id),
+      insertBlocks: affectedNew,
+      position: { type: "start" },
+    };
+  }
+
   // Medium path: delete the affected run, append the replacement blocks
   // immediately after the last unchanged prefix block.
   return {
     kind: "medium",
     deleteIds: affectedOld.map((b) => b.id),
     insertBlocks: affectedNew,
-    afterId,
+    position: { type: "after_block", after_block: { id: oldBlocks[prefix - 1]!.id } },
   };
 }
 

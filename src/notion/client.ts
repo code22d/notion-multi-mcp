@@ -8,7 +8,33 @@ import type { NotionAccount } from "../mcp/types";
 import { describeBlockRequestProblems, validateBlockRequestTree } from "./block-write-schema";
 
 const NOTION_API = "https://api.notion.com/v1";
-export const NOTION_VERSION = "2025-09-03";
+// API version 2026-03-11. Three documented breaking changes, all handled:
+//   1. Append block children takes `position` instead of the flat `after`.
+//      See BlockPosition below and appendInChunks() in ./block-clone.ts.
+//   2. `archived` is removed from requests and responses in favour of
+//      `in_trash`. notion_update_page still ACCEPTS `archived` as an input key
+//      — it is a documented alias in the tool schema — but translates it and
+//      never forwards it. See src/tools/update-page/properties.ts.
+//   3. The `transcription` block type is renamed `meeting_notes`. Read-only
+//      here; both names render, see src/notion/markdown/from-blocks.ts.
+// The block WRITE schema in ./block-write-schema.ts was re-derived against this
+// version and did not change — test/write-schema-vs-sdk.ts now checks that
+// against the SDK's generated types on every run rather than trusting it.
+export const NOTION_VERSION = "2026-03-11";
+
+/**
+ * Where an append lands relative to the parent's existing children — the
+ * `position` object that replaced the flat `after` string in 2026-03-11.
+ *
+ * Written exactly as Notion's `ContentPositionSchema` so nothing has to
+ * translate it on the way out. Omitting `position` entirely means "end", which
+ * is what every append here did before the medium path needed to insert into
+ * the middle of a page.
+ */
+export type BlockPosition =
+  | { type: "after_block"; after_block: { id: string } }
+  | { type: "start" }
+  | { type: "end" };
 
 // -----------------------------------------------------------------------------
 // Retry policy
@@ -840,7 +866,7 @@ export interface NotionPageObject {
   id: string;
   created_time: string;
   last_edited_time: string;
-  archived: boolean;
+  /** 2026-03-11 removed `archived` from responses; this is its replacement. */
   in_trash?: boolean;
   parent: { type: string; [key: string]: unknown };
   properties: Record<string, unknown>;
@@ -861,7 +887,8 @@ export interface NotionDatabaseObject {
   properties?: Record<string, unknown>;
   parent: { type: string; [key: string]: unknown };
   url: string;
-  archived?: boolean;
+  /** 2026-03-11: `archived` is gone from database responses too. */
+  in_trash?: boolean;
   is_inline?: boolean;
   icon?: NotionIcon | null;
   cover?: NotionCover | null;
@@ -908,7 +935,8 @@ export interface NotionBlockObject {
   id: string;
   type: string;
   has_children?: boolean;
-  archived?: boolean;
+  /** 2026-03-11: `archived` is gone from block responses too. */
+  in_trash?: boolean;
   [key: string]: unknown;
 }
 

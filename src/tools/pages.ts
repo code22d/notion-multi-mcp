@@ -83,12 +83,11 @@ export function registerPageTools(register: (def: ToolDef) => void): void {
       "(set verified/unverified with optional expiry). " +
       "BLOCK IDS AND COMMENTS: `update_content` normally edits in place or replaces only the " +
       "affected run of blocks, so untouched blocks keep their ids and any block-level comments " +
-      "stay attached. Two cases cannot: an edit that changes the FIRST block on the page (Notion " +
-      "has no prepend endpoint) and an edit inserting more than 100 blocks at once. Those fall " +
-      "back to a whole-page rewrite — every block is deleted and recreated, ids change, and " +
-      "block-level comments on the page are lost. The tool result says so explicitly when it " +
-      "happens. `replace_content` and `apply_template` always rewrite; only `update_content`'s " +
-      "fast and medium paths preserve ids.",
+      "stay attached. Two cases cannot: an edit where EVERY block on the page changes, and an " +
+      "edit inserting more than 100 blocks at once. Those fall back to a whole-page rewrite — " +
+      "every block is deleted and recreated, ids change, and block-level comments on the page " +
+      "are lost. The tool result says so explicitly when it happens. `replace_content` and " +
+      "`apply_template` always rewrite; only `update_content`'s fast and medium paths preserve ids.",
     inputSchema: UPDATE_PAGE_INPUT_SCHEMA as unknown as Record<string, unknown>,
     handler: updatePageHandler,
   });

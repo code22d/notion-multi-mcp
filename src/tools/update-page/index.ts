@@ -38,7 +38,9 @@ export const UPDATE_PAGE_INPUT_SCHEMA = {
         "`place:{name}:{name|address|latitude|longitude|google_place_id}`. Checkboxes use `__YES__`/`__NO__`. " +
         "Properties colliding with `id` or `url` must be prefixed `userDefined:`. " +
         "Three reserved keys are page-level controls rather than columns: `in_trash` (move to/from trash), " +
-        "`archived` (legacy alias for in_trash), and `is_locked` (lock the page against edits in the Notion UI).",
+        "`archived` (accepted alias — Notion removed the field in API version 2026-03-11, so it is " +
+        "translated to `in_trash` and never sent; `in_trash` wins if both are given), and `is_locked` " +
+        "(lock the page against edits in the Notion UI).",
     },
     content_updates: {
       type: "array",

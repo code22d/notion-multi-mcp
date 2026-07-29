@@ -33,13 +33,15 @@ import {
   CLONE_FIXTURES,
   DEEP_INSERT_PAGE,
   FAST_PATH_PAGE,
+  ENTIRE_PAGE_CHANGED_PAGE,
+  FIRST_BLOCK_EDIT_PAGE,
   FIVE_DEEP_MARKDOWN,
-  FULL_FALLBACK_PAGE,
   HELLO_WORLD_PAGE,
   NESTED_TOGGLE_PAGE,
   PAGE_WITH_CHILD,
   PRESERVATION_FIXTURES,
   PROPERTY_FIXTURES,
+  START_POSITION_PAGE,
   THREE_BLOCK_PAGE,
   VERIFICATION_FIXTURES,
 } from "./update-page-fixtures.ts";
@@ -77,9 +79,6 @@ console.log("\n[normaliseProperties]");
 for (const f of PROPERTY_FIXTURES) {
   const got = normaliseProperties(f.input);
   eq(got.notionProps, f.expected, `${f.name}: props match`);
-  if (f.expectedArchived !== undefined) {
-    assert(got.archived === f.expectedArchived, `${f.name}: archived=${f.expectedArchived}`);
-  }
   if (f.expectedInTrash !== undefined) {
     assert(got.inTrash === f.expectedInTrash, `${f.name}: inTrash=${f.expectedInTrash}`);
   }
@@ -326,18 +325,47 @@ console.log("\n[planUpdate]");
   assert(plan.kind === "medium", `two affected blocks with heading prefix → medium (got ${plan.kind})`);
   if (plan.kind === "medium") {
     eq(plan.deleteIds.sort(), ["b2", "b3"].sort(), "medium path targets only the affected blocks");
-    eq(plan.afterId, "b1", "medium path uses the common-prefix block as the after anchor");
+    eq(plan.position, { type: "after_block", after_block: { id: "b1" } },
+      "medium path positions the insert after the common-prefix block");
     eq(plan.insertBlocks.length, 2, "medium path inserts two replacement blocks");
   }
 }
 
 {
-  // First block affected → full fallback.
-  const old = FULL_FALLBACK_PAGE.existing;
+  // First block affected, and it is a leaf → FAST. updateBlock names its
+  // target by id, so the missing prefix anchor is irrelevant. This used to be
+  // a full rewrite purely because the no-prefix bail was checked first.
+  const old = FIRST_BLOCK_EDIT_PAGE.existing;
   const newMd = blocksToMarkdown(old).replace("Alice", "Charlie");
   const newBlocks = markdownToBlocks(newMd);
   const plan = planUpdate(old, newBlocks);
-  assert(plan.kind === "full", `first-block edit has no prefix anchor → full (got ${plan.kind})`);
+  assert(plan.kind === "fast", `a leaf edit on the first block is in-place (got ${plan.kind})`);
+  if (plan.kind === "fast") eq(plan.oldBlock.id, "ff-only", "…targeting the block that was already there");
+}
+
+{
+  // No prefix, but there IS a suffix worth keeping, and the affected block is
+  // not a fast-path leaf. 2026-03-11's `position: { type: "start" }` is what
+  // makes this a medium plan instead of a whole-page rewrite.
+  const old = START_POSITION_PAGE.existing;
+  const newMd = blocksToMarkdown(old).replace("Alice", "Bob");
+  const newBlocks = markdownToBlocks(newMd);
+  const plan = planUpdate(old, newBlocks);
+  assert(plan.kind === "medium", `no-prefix edit with a surviving suffix → medium (got ${plan.kind})`);
+  if (plan.kind === "medium") {
+    eq(plan.position, { type: "start" }, "…positioned at the start of the page");
+    eq(plan.deleteIds, ["sp-toggle"], "…deleting only the toggle");
+  }
+}
+
+{
+  // Every block changed — nothing to preserve, so the full rewrite stands.
+  const old = ENTIRE_PAGE_CHANGED_PAGE.existing;
+  const newMd = blocksToMarkdown(old).replace(/Alice/g, "Charlie");
+  const newBlocks = markdownToBlocks(newMd);
+  const plan = planUpdate(old, newBlocks);
+  assert(plan.kind === "full", `whole-page change → full (got ${plan.kind})`);
+  if (plan.kind === "full") eq(plan.reason, "entire page changed", "…and says why");
 }
 
 {
@@ -350,7 +378,8 @@ console.log("\n[planUpdate]");
   assert(plan.kind === "medium", `nested edit falls through to medium (got ${plan.kind})`);
   if (plan.kind === "medium") {
     eq(plan.deleteIds, ["nt-toggle"], "medium path deletes only the toggle, not the outer para");
-    eq(plan.afterId, "nt-outer", "anchor is the common-prefix paragraph");
+    eq(plan.position, { type: "after_block", after_block: { id: "nt-outer" } },
+      "positioned after the common-prefix paragraph");
   }
 }
 
@@ -414,8 +443,9 @@ console.log("\n[update_content — medium path]");
   const deletedIds = deleteCalls.map((c) => c.args[0] as string).sort();
   eq(deletedIds, ["b2", "b3"], "deleted the correct blocks — heading b1 retained");
   eq(appendCalls.length, 1, "exactly one appendBlockChildren call (small insert, single chunk)");
-  const appendBody = appendCalls[0]!.args[1] as { children: unknown[]; after?: string };
-  eq(appendBody.after, "b1", "appendBlockChildren anchored after the heading (b1)");
+  const appendBody = appendCalls[0]!.args[1] as { children: unknown[]; position?: unknown };
+  eq(appendBody.position, { type: "after_block", after_block: { id: "b1" } },
+    "appendBlockChildren positions the insert after the heading (b1)");
   eq(appendBody.children.length, 2, "append carries the two replacement paragraphs");
   assert(
     JSON.stringify(appendBody.children).includes("Bob"),
@@ -426,9 +456,9 @@ console.log("\n[update_content — medium path]");
 console.log("\n[update_content — full fallback]");
 
 {
-  const { client, calls } = makeFakeClient(FULL_FALLBACK_PAGE.existing);
+  const { client, calls } = makeFakeClient(ENTIRE_PAGE_CHANGED_PAGE.existing);
   const result = await updateContentHandler(client, "page-1", [
-    { old_str: "Alice", new_str: "Charlie" },
+    { old_str: "Alice", new_str: "Charlie", replace_all_matches: true },
   ]);
   assert(!result.isError, "full fallback succeeds");
   assert(
@@ -437,10 +467,32 @@ console.log("\n[update_content — full fallback]");
   );
   const deleteCalls = calls.filter((c) => c.method === "deleteBlock");
   const appendCalls = calls.filter((c) => c.method === "appendBlockChildren");
-  eq(deleteCalls.length, 1, "first-block edit → all existing blocks deleted");
-  eq(appendCalls.length, 1, "append happens without an anchor");
-  const appendBody = appendCalls[0]!.args[1] as { children: unknown[]; after?: string };
-  assert(appendBody.after === undefined, "full fallback does NOT pass an `after:` anchor");
+  eq(deleteCalls.length, 2, "whole-page change → every existing block deleted");
+  eq(appendCalls.length, 1, "append happens without a position");
+  const appendBody = appendCalls[0]!.args[1] as { children: unknown[]; position?: unknown; after?: unknown };
+  assert(appendBody.position === undefined, "full fallback sends no `position` — the default is the end");
+  assert(appendBody.after === undefined, "…and no `after` either; 2026-03-11 removed it");
+}
+
+console.log("\n[update_content — no prefix, but a suffix worth keeping]");
+
+{
+  const { client, calls } = makeFakeClient(START_POSITION_PAGE.existing);
+  const result = await updateContentHandler(client, "page-1", [
+    { old_str: "Alice", new_str: "Bob" },
+  ]);
+  assert(!result.isError, "start-positioned medium path succeeds");
+  const text = result.content[0]?.text ?? "";
+  assert(text.includes("Medium path"), "…and it IS the medium path");
+  assert(text.includes("at the top of the page"), "…and the summary says where the insert went");
+
+  const deletedIds = calls.filter((c) => c.method === "deleteBlock").map((c) => c.args[0] as string);
+  eq(deletedIds, ["sp-toggle"], "the untouched tail paragraph is not deleted — it keeps its id");
+
+  const appendCalls = calls.filter((c) => c.method === "appendBlockChildren");
+  eq(appendCalls.length, 1, "one append");
+  eq((appendCalls[0]!.args[1] as { position?: unknown }).position, { type: "start" },
+    "…carrying position: start, 2026-03-11's prepend");
 }
 
 console.log("\n[update_content — nested toggle edit falls through]");
@@ -529,11 +581,12 @@ console.log("\n[update_content — deep insertion stays on the medium path]");
 
   const appends = calls.filter((c) => c.method === "appendBlockChildren");
   assert(appends.length > 1, `deferral engaged — ${appends.length} appends, not one`);
-  const first = appends[0]!.args[1] as { children: unknown[]; after?: string };
-  eq(first.after, "di-heading", "the first append is still anchored after the surviving heading");
+  const first = appends[0]!.args[1] as { children: unknown[]; position?: unknown };
+  eq(first.position, { type: "after_block", after_block: { id: "di-heading" } },
+    "the first append is still positioned after the surviving heading");
   assert(
-    appends.slice(1).every((c) => (c.args[1] as { after?: string }).after === undefined),
-    "follow-up appends carry no anchor — they target blocks that hold nothing else"
+    appends.slice(1).every((c) => (c.args[1] as { position?: unknown }).position === undefined),
+    "follow-up appends carry no position — they target blocks that hold nothing else"
   );
 
   // Every emitted body has to be one Notion would take. A stubbed client
@@ -562,9 +615,9 @@ console.log("\n[update_content — deep insertion stays on the medium path]");
 console.log("\n[update_content — the full fallback says what it cost]");
 
 {
-  const { client } = makeFakeClient(FULL_FALLBACK_PAGE.existing);
+  const { client } = makeFakeClient(ENTIRE_PAGE_CHANGED_PAGE.existing);
   const result = await updateContentHandler(client, "page-1", [
-    { old_str: "Alice", new_str: "Charlie" },
+    { old_str: "Alice", new_str: "Charlie", replace_all_matches: true },
   ]);
   const text = result.content[0]?.text ?? "";
   assert(text.includes("Full fallback"), "still reports the fallback");
@@ -582,28 +635,33 @@ console.log("\n[update_content — the full fallback says what it cost]");
   );
 }
 
-console.log("\n[appendInChunks] a second anchored chunk follows the first, not the anchor");
+console.log("\n[appendInChunks] a second positioned chunk follows the first, not the position");
 
 {
-  // `after:` inserts immediately behind the named block, so re-using the
-  // ORIGINAL anchor for chunk 2 would put it in front of chunk 1. The anchor
-  // has to walk forward. 150 blocks = two chunks.
+  // `after_block` inserts immediately behind the named block, so re-using the
+  // ORIGINAL position for chunk 2 would put it in front of chunk 1. The
+  // position has to walk forward. 150 blocks = two chunks.
   const { client, calls, currentChildren } = makeFakeClient(HELLO_WORLD_PAGE.existing);
   const blocks = Array.from({ length: 150 }, (_, i) => ({
     type: "paragraph",
     paragraph: { rich_text: [{ type: "text", text: { content: `P${i}` } }] },
   })) as unknown as Parameters<typeof appendInChunks>[2];
 
-  await appendInChunks(client as unknown as NotionClient, "page-1", blocks, "b1");
+  await appendInChunks(client as unknown as NotionClient, "page-1", blocks, {
+    type: "after_block",
+    after_block: { id: "b1" },
+  });
 
   const appends = calls.filter((c) => c.method === "appendBlockChildren");
   eq(appends.length, 2, "150 blocks → two chunks");
-  eq((appends[0]!.args[1] as { after?: string }).after, "b1", "chunk 1 anchors at the caller's block");
+  eq((appends[0]!.args[1] as { position?: unknown }).position,
+    { type: "after_block", after_block: { id: "b1" } }, "chunk 1 positions at the caller's block");
   const chunk1 = (appends[0]!.args[1] as { children: unknown[] }).children;
   eq(chunk1.length, 100, "chunk 1 is a full 100");
+  const chunk2Pos = (appends[1]!.args[1] as { position?: { after_block?: { id?: string } } }).position;
   assert(
-    (appends[1]!.args[1] as { after?: string }).after !== "b1",
-    "chunk 2 does NOT re-use the original anchor"
+    chunk2Pos?.after_block?.id !== undefined && chunk2Pos.after_block.id !== "b1",
+    "chunk 2 does NOT re-use the original position"
   );
 
   const texts = currentChildren().map(

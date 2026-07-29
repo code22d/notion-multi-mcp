@@ -231,6 +231,11 @@ function renderBlock(block: HydratedBlock, ctx: Ctx): string | null {
       )} -->`;
     case "tab":
       return renderTabs(block, ctx);
+    // 2026-03-11 renamed `transcription` → `meeting_notes`. Both are listed on
+    // purpose: the `default` arm below renders either identically, but naming
+    // them keeps the rename findable when someone greps for it, and pins that
+    // an old response body is still handled rather than accidentally handled.
+    // Neither has a create shape, so nothing needs to change on the write side.
     case "meeting_notes":
     case "transcription":
       return `${ctx.indent}<!-- notion:${type} -->`;

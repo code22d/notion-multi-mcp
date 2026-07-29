@@ -16,7 +16,7 @@
 // substitution that keeps block structure unchanged (see content.ts).
 // -----------------------------------------------------------------------------
 
-import type { NotionClient } from "../../notion/client";
+import type { BlockPosition, NotionClient } from "../../notion/client";
 import type { HydratedBlock } from "../../notion/markdown/from-blocks";
 import type { ToolResult } from "../../mcp/types";
 import { markdownToBlocks, type BlockRequest } from "../../notion/markdown/to-blocks";
@@ -33,22 +33,22 @@ import { checkPreservation } from "./preservation";
  * Core delete+append helper — the medium path of update_content uses this
  * directly, and replace_content wraps it to do the whole page at once.
  *
- * When `afterId` is provided, Notion's `after:` parameter anchors the
- * insertion immediately after that block.
+ * `position` places the insertion — Notion's 2026-03-11 append position, so
+ * `after_block` behind a surviving block or `start` at the top of the page.
  *
  * The inserted tree goes through the same write-schema fitting the create path
  * uses, so an insertion nested deeper than one request body can carry is split
  * across follow-up appends instead of forcing the caller to give up on the
- * anchor. Those follow-ups land under blocks this call just created, which hold
- * nothing else — so only the FIRST request needs the anchor, and preserving it
- * is what keeps the untouched blocks on the page (and their comments) alive.
+ * position. Those follow-ups land under blocks this call just created, which
+ * hold nothing else — so only the FIRST request needs a position, and keeping
+ * it is what keeps the untouched blocks on the page (and their comments) alive.
  */
 export async function replaceBlockRange(
   client: NotionClient,
   pageId: string,
   deleteIds: string[],
   insertBlocks: BlockRequest[],
-  afterId?: string
+  position?: BlockPosition
 ): Promise<{ deleted: number; inserted: number; deferred: boolean }> {
   let deleted = 0;
   for (const id of deleteIds) {
@@ -63,7 +63,7 @@ export async function replaceBlockRange(
 
   const fitted = fitRequestTree(insertBlocks);
   const deferred = hasPendingWork(fitted);
-  await appendClonedTree(client, pageId, fitted, AUTHORED_CLONE_POLICY, afterId);
+  await appendClonedTree(client, pageId, fitted, AUTHORED_CLONE_POLICY, position);
   return { deleted, inserted: fitted.length, deferred };
 }
 

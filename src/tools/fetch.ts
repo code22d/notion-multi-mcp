@@ -73,7 +73,11 @@ async function fetchHandler(args: Record<string, unknown>, ctx: ToolContext): Pr
       `URL: ${page.url}`,
       `ID: ${page.id}`,
       `Last edited: ${page.last_edited_time}`,
-      `Archived: ${page.archived ? "yes" : "no"}`,
+      // 2026-03-11 renamed the response field `archived` → `in_trash`. Read
+      // both: an older response (or a proxy that hasn't caught up) still says
+      // `archived`, and reporting "no" for a trashed page is worse than the
+      // three characters this costs.
+      `In trash: ${(page.in_trash ?? (page as { archived?: boolean }).archived) ? "yes" : "no"}`,
     ];
 
     // Append block children (text content) — shallow walk, since a full enhanced-markdown

@@ -321,18 +321,34 @@ console.log("\n[update_properties] is_locked is untouched when absent");
   eq(normaliseProperties({ Name: "x" }).isLocked, undefined, "absent ⇒ undefined ⇒ key omitted from the PATCH");
 }
 
-console.log("\n[update_properties] archived / in_trash still behave exactly as before");
+console.log("\n[update_properties] `archived` is translated to in_trash, not forwarded");
 {
-  const r = normaliseProperties({ archived: true, in_trash: false, Name: "x" });
-  eq(r.archived, true, "archived preserved (still valid on the pinned 2025-09-03)");
-  eq(r.inTrash, false, "in_trash preserved");
-  eq(Object.keys(r.notionProps), ["Name"], "neither leaks into properties");
+  // 2026-03-11 removed `archived` from the API. It stays a valid INPUT key —
+  // it is documented in the tool schema and callers use it — so it is
+  // translated here and never reaches the wire.
+  eq(normaliseProperties({ archived: true }).inTrash, true, "archived: true → inTrash: true");
+  eq(normaliseProperties({ archived: false }).inTrash, false, "archived: false → inTrash: false");
+  eq(normaliseProperties({ archived: "__YES__" }).inTrash, true, "the __YES__ sentinel still works");
+  assert(
+    !("archived" in normaliseProperties({ archived: true })),
+    "NormalisedProps has no `archived` field left to forward"
+  );
+  eq(Object.keys(normaliseProperties({ archived: true, Name: "x" }).notionProps), ["Name"],
+    "…and it does not leak into the properties map");
 }
 
-console.log("\n[update_properties] all three controls can be set together");
+console.log("\n[update_properties] an explicit in_trash beats the legacy alias");
 {
-  const r = normaliseProperties({ archived: false, in_trash: false, is_locked: true });
-  eq([r.archived, r.inTrash, r.isLocked], [false, false, true], "independent flags");
+  // Both given and disagreeing: the newer key names what the API actually
+  // does, so it wins rather than the two racing on object-key order.
+  eq(normaliseProperties({ archived: true, in_trash: false }).inTrash, false, "in_trash: false wins over archived: true");
+  eq(normaliseProperties({ in_trash: true, archived: false }).inTrash, true, "…and in the other key order too");
+}
+
+console.log("\n[update_properties] all controls can be set together");
+{
+  const r = normaliseProperties({ archived: false, is_locked: true });
+  eq([r.inTrash, r.isLocked], [false, true], "independent flags");
 }
 
 // -----------------------------------------------------------------------------

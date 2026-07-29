@@ -160,6 +160,30 @@ transcription of the SDK's generated request types, not the server. A false
 positive costs a log line, which is the whole design; a false negative means the
 flag is quietly narrower than it looks. Only a live call closes that.
 
+## Notion API version
+
+Pinned to **`2026-03-11`** — `NOTION_VERSION` in
+[`src/notion/client.ts`](./src/notion/client.ts), sent as the `Notion-Version`
+header on every request. Its three breaking changes are handled as follows.
+
+| change | how it's handled |
+| --- | --- |
+| Append block children takes a `position` object instead of a flat `after` string | `appendInChunks` sends `position` (`after_block` / `start`), and walks it forward between 100-block chunks so a multi-chunk insert keeps its order |
+| `archived` removed from requests and responses, replaced by `in_trash` | `notion_update_page` still **accepts** `archived` as an input key — it's a documented alias — but translates it to `in_trash` and never forwards it. An explicit `in_trash` wins if both are given. Reads use `in_trash`, falling back to `archived` so an older response body still reports correctly |
+| Block type `transcription` renamed `meeting_notes` | Read-only. Both names render; neither has a create shape, so nothing on the write side changes |
+
+`position: { type: "start" }` is a capability the old version simply didn't have,
+and it removed a whole class of full-page rewrites — see the next section.
+
+The block **write** schema in
+[`src/notion/block-write-schema.ts`](./src/notion/block-write-schema.ts) is a hand
+transcription of the SDK's generated request types, and those are
+version-dependent. It was re-derived against `2026-03-11` and nothing changed —
+but rather than leave that as a claim,
+[`test/write-schema-vs-sdk.ts`](./test/write-schema-vs-sdk.ts) now checks every
+row of the table against the `.d.ts` on each run, so the next SDK bump surfaces a
+schema change as a failing assertion instead of a silent divergence.
+
 ## `notion_update_page` — when block ids survive, and when they don't
 
 Notion attaches **block-level comments to block ids**. Delete a block and recreate it
@@ -176,21 +200,26 @@ preserve ids?" is really "did this edit preserve the discussion on the page?", a
 `replace_content` and `apply_template` are always a full rewrite — that is what they
 are for. `update_content` uses the full path only when it has no alternative:
 
-- **the edit changes the first block on the page.** The append endpoint can only place
-  content *after* an existing block, and there is no prepend, so there is no anchor.
-- **the edit inserts more than 100 blocks at once.** That needs several anchored
+- **every block on the page changed.** Nothing to preserve either way.
+- **the edit inserts more than 100 blocks at once.** That needs several positioned
   appends in sequence, and their ordering depends on each response echoing the blocks
   it created — which nothing has yet confirmed against the live API.
-- **every block on the page changed.** Nothing to preserve either way.
 
-Deeply nested insertions used to be a fourth case and are not any more: content nested
-deeper than one request body can carry is now split across follow-up appends *under the
-blocks the anchored append just created*, so the anchor survives.
+Two cases that used to land here no longer do:
+
+- **an edit at the top of the page.** There was no way to say "put this at the
+  beginning" until `2026-03-11` added `position: { type: "start" }`. A one-block leaf
+  edit at index 0 is now an in-place `updateBlock` (it names its target by id and never
+  needed an anchor at all); anything else at index 0 is a medium plan positioned at the
+  start, so everything below it keeps its ids.
+- **a deeply nested insertion.** Content nested deeper than one request body can carry
+  is split across follow-up appends *under the blocks the positioned append just
+  created*, so the position survives.
 
 When the full path does fire, the tool result says what it cost, in as many words:
 
 ```
-Full fallback — affected range starts at page index 0 (Notion has no prepend endpoint).
+Full fallback — entire page changed.
 Replaced page 3acde14e… content — deleted 5 existing blocks, appended 5 new blocks.
 
 ⚠️  This rewrote the whole page: every block was deleted and recreated, so block ids
@@ -198,9 +227,8 @@ were NOT preserved and any block-level comments that were attached to them are g
 The page's content is intact — this is a structural cost, not a content loss. …
 ```
 
-If ids matter for a particular page, keep edits away from the first block — an
-unchanged heading or intro paragraph at the top is enough of an anchor for everything
-below it to take the medium path.
+If ids matter for a particular page, the thing to avoid is an edit that touches every
+block at once. Anything narrower keeps the blocks it didn't touch.
 
 ## Architecture
 
